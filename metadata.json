@@ -1,0 +1,6 @@
+{
+  "name": "AudioScribe & Subtitle Studio",
+  "description": "智能語音轉錄、AI內容摘要、SRT字幕生成與多語言翻譯儀表板，支援長音檔自動分段切割與多格式匯出",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
