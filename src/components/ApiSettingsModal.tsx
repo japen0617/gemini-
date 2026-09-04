@@ -30,8 +30,8 @@ interface ApiSettingsModalProps {
 }
 
 const GCP_REGIONS = [
-  { id: 'global', name: 'global (全球統一路由 / Vertex Agent)' },
-  { id: 'us-central1', name: 'us-central1 (愛荷華, 推薦)' },
+  { id: 'global', name: 'global (全球統一端點 - 推薦 / Gemini 3.5 Transcribe)' },
+  { id: 'us-central1', name: 'us-central1 (愛荷華)' },
   { id: 'asia-east1', name: 'asia-east1 (台灣彰化)' },
   { id: 'asia-northeast1', name: 'asia-northeast1 (日本東京)' },
   { id: 'asia-southeast1', name: 'asia-southeast1 (新加坡)' },
@@ -52,7 +52,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
   );
   const [keyInput, setKeyInput] = useState(apiConfig.apiKey || '');
   const [gcpProjectId, setGcpProjectId] = useState(apiConfig.gcpProjectId || '');
-  const [gcpLocation, setGcpLocation] = useState(apiConfig.gcpLocation || 'us-central1');
+  const [gcpLocation, setGcpLocation] = useState(apiConfig.gcpLocation || 'global');
   const [customEndpoint, setCustomEndpoint] = useState(apiConfig.customEndpoint || '');
   const [showAdvanced, setShowAdvanced] = useState(Boolean(apiConfig.customEndpoint));
 
@@ -63,6 +63,8 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
     platform?: 'gemini_api' | 'agent_platform';
     detectedType?: 'gemini_api' | 'agent_platform';
     label?: string;
+    modelName?: string;
+    maxAudioDurationMinutes?: number;
     endpointUrl?: string;
     latencyMs?: number;
     message?: string;
@@ -78,15 +80,15 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
       return customEndpoint.trim();
     }
     if (selectedPlatform === 'agent_platform') {
-      const loc = gcpLocation || 'us-central1';
+      const loc = gcpLocation || 'global';
       const proj = gcpProjectId.trim() || '{PROJECT_ID}';
       const host = loc === 'global' ? 'aiplatform.googleapis.com' : `${loc}-aiplatform.googleapis.com`;
-      return `https://${host}/v1/projects/${proj}/locations/${loc}/publishers/google/models/gemini-3.7-flash:generateContent`;
+      return `https://${host}/v1/projects/${proj}/locations/${loc}/publishers/google/models/gemini-3.5-transcribe-preview:generateContent`;
     }
     if (selectedPlatform === 'gemini_api') {
-      return 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent';
+      return 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
     }
-    return 'https://generativelanguage.googleapis.com 或 https://{region}-aiplatform.googleapis.com (依金鑰自動路由)';
+    return 'https://aiplatform.googleapis.com (Agent Platform) 或 https://generativelanguage.googleapis.com (自動路由)';
   };
 
   // Perform probe testing on target platform and endpoint
@@ -280,9 +282,9 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                     <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
                   )}
                 </div>
-                <span className="text-xs font-bold">Vertex / Agent Platform</span>
-                <span className="text-[10px] text-slate-400 mt-0.5 leading-tight">
-                  Google Cloud 企業端點
+                <span className="text-xs font-bold">Agent Platform</span>
+                <span className="text-[10px] text-purple-300 font-mono mt-0.5 leading-tight">
+                  Gemini 3.5 Transcribe
                 </span>
               </button>
 
@@ -400,8 +402,44 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                   </div>
                 </div>
 
+                {/* Gemini 3.5 Transcribe Preview Model Specs */}
+                <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-500/40 space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-purple-200 flex items-center space-x-1.5">
+                      <Sparkles className="w-4 h-4 text-purple-400" />
+                      <span>旗艦模型：Gemini 3.5 Transcribe Preview</span>
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-mono border border-purple-500/30">
+                      gemini-3.5-transcribe-preview
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-purple-200/90 leading-relaxed">
+                    Gemini 3.5 Transcribe 是專業級語音轉錄核心主力，融合深度推理多模態能力與高度優化的語音轉文字工作流，單一請求即可完成完整預錄音訊檔案轉錄。
+                  </p>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 font-mono text-[10px]">
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">模型代號</span>
+                      <span className="text-purple-300 font-semibold truncate block" title="gemini-3.5-transcribe-preview">
+                        3.5-transcribe
+                      </span>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">資料類型</span>
+                      <span className="text-purple-300 font-semibold">Audio ➔ Text</span>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">最大時長</span>
+                      <span className="text-purple-300 font-semibold">高達 15 分鐘</span>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">部署區域</span>
+                      <span className="text-purple-300 font-semibold">global / 全球</span>
+                    </div>
+                  </div>
+                </div>
+
                 <p className="text-[11px] text-slate-400 leading-relaxed bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
-                  💡 <strong className="text-slate-300">提示：</strong>Vertex AI 語音轉錄與生成模型支援 Google Cloud 區域端點（推薦 <span className="text-purple-300">us-central1</span> 或 <span className="text-purple-300">asia-east1</span>）。若使用的是 Google AI Studio 普及金鑰（以 <code className="text-indigo-300 font-mono">AIza...</code> 開頭），建議切換至 <strong className="text-indigo-300">「Google AI Studio」</strong> 享有最佳連線效率。
+                  💡 <strong className="text-slate-300">提示：</strong>Agent Platform 預設採用 <span className="text-purple-300 font-mono">global</span> 全球統一路由端點（aiplatform.googleapis.com），如需指定專案請填寫 GCP 專案 ID。若使用的是 Google AI Studio 普及金鑰（以 <code className="text-indigo-300 font-mono">AIza...</code> 開頭），可切換至 <strong className="text-indigo-300">「Google AI Studio」</strong> 進行轉錄。
                 </p>
               </div>
             )}

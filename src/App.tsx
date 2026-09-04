@@ -16,6 +16,8 @@ import {
   getAllProjects,
   saveProjectToDB,
   deleteProjectFromDB,
+  deleteMultipleProjectsFromDB,
+  clearAllProjectsFromDB,
   saveAudioBlob,
   getAudioBlob,
 } from './utils/db';
@@ -182,7 +184,7 @@ export default function App() {
     setCurrentView('detail');
   };
 
-  // Delete project
+  // Delete single project
   const handleDeleteProject = async (id: string) => {
     await deleteProjectFromDB(id);
     await loadProjects();
@@ -190,6 +192,25 @@ export default function App() {
       setSelectedProject(null);
       setCurrentView('dashboard');
     }
+  };
+
+  // Batch delete multiple projects
+  const handleDeleteMultipleProjects = async (ids: string[]) => {
+    if (!ids || ids.length === 0) return;
+    await deleteMultipleProjectsFromDB(ids);
+    await loadProjects();
+    if (selectedProject && ids.includes(selectedProject.id)) {
+      setSelectedProject(null);
+      setCurrentView('dashboard');
+    }
+  };
+
+  // Clear all projects
+  const handleClearAllProjects = async () => {
+    await clearAllProjectsFromDB();
+    await loadProjects();
+    setSelectedProject(null);
+    setCurrentView('dashboard');
   };
 
   // Update existing project
@@ -370,6 +391,7 @@ export default function App() {
               offsetSeconds: slice.startSec,
               audioDuration: slice.duration,
               generateSummary: i === 0,
+              fileName,
             });
 
             if (apiResult.ok) {
@@ -378,7 +400,7 @@ export default function App() {
 
             if (apiResult.isAuthError) {
               setIsApiSettingsOpen(true);
-              throw new Error(`片段 ${i + 1} 授權失敗: ${apiResult.error}`);
+              throw new Error(`片段 ${i + 1} 授權未通過: ${apiResult.error || '請確認 API 金鑰是否有效且具備 Generative Language API 權限'}`);
             }
 
             if (chunkAttempt < maxChunkAttempts) {
@@ -579,6 +601,8 @@ export default function App() {
             projects={projects}
             onOpenProject={handleOpenProject}
             onDeleteProject={handleDeleteProject}
+            onDeleteMultipleProjects={handleDeleteMultipleProjects}
+            onClearAllProjects={handleClearAllProjects}
             onNewTranscription={() => setCurrentView('uploader')}
           />
         ) : currentView === 'uploader' ? (
@@ -601,6 +625,8 @@ export default function App() {
             projects={projects}
             onOpenProject={handleOpenProject}
             onDeleteProject={handleDeleteProject}
+            onDeleteMultipleProjects={handleDeleteMultipleProjects}
+            onClearAllProjects={handleClearAllProjects}
             onNewTranscription={() => setCurrentView('uploader')}
           />
         )}

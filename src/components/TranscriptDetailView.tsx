@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import * as OpenCC from 'opencc-js';
 import {
   FileText,
   Languages,
@@ -73,6 +74,50 @@ export const TranscriptDetailView: React.FC<TranscriptDetailViewProps> = ({
   // Editing Segment
   const [editingSegmentId, setEditingSegmentId] = useState<number | null>(null);
   const [editingText, setEditingText] = useState<string>('');
+  const [convertedFeedback, setConvertedFeedback] = useState<boolean>(false);
+
+  // One-click convert all subtitles and summary to Traditional Chinese
+  const handleConvertToTraditional = () => {
+    try {
+      const s2tw = OpenCC.Converter({ from: 'cn', to: 'tw' });
+      const updatedSegments = project.segments.map((s) => ({
+        ...s,
+        text: s2tw(s.text),
+        speaker: s.speaker ? s2tw(s.speaker) : s.speaker,
+      }));
+      const updatedFullTranscript = s2tw(project.fullTranscript || '');
+      let updatedSummary = project.summary;
+      if (project.summary) {
+        updatedSummary = {
+          ...project.summary,
+          executiveSummary: project.summary.executiveSummary ? s2tw(project.summary.executiveSummary) : '',
+          keyPoints: project.summary.keyPoints?.map((kp) => s2tw(kp)) || [],
+          actionItems: project.summary.actionItems?.map((ai) => s2tw(ai)) || [],
+          chapters:
+            project.summary.chapters?.map((ch) => ({
+              ...ch,
+              title: s2tw(ch.title),
+              description: s2tw(ch.description),
+            })) || [],
+          keywords: project.summary.keywords?.map((kw) => s2tw(kw)) || [],
+          toneAndSentiment: project.summary.toneAndSentiment ? s2tw(project.summary.toneAndSentiment) : '',
+          targetAudience: project.summary.targetAudience ? s2tw(project.summary.targetAudience) : '',
+        };
+      }
+
+      onUpdateProject({
+        ...project,
+        fullTranscript: updatedFullTranscript,
+        segments: updatedSegments,
+        summary: updatedSummary,
+      });
+
+      setConvertedFeedback(true);
+      setTimeout(() => setConvertedFeedback(false), 2500);
+    } catch (err) {
+      console.error('Failed to convert to Traditional Chinese:', err);
+    }
+  };
   const [editingSpeaker, setEditingSpeaker] = useState<string>('');
 
   const playerRef = useRef<HTMLAudioElement | null>(null);
@@ -120,6 +165,18 @@ export const TranscriptDetailView: React.FC<TranscriptDetailViewProps> = ({
       if (apiConfig?.apiKey) {
         headers['x-gemini-api-key'] = apiConfig.apiKey;
       }
+      if (apiConfig?.platform) {
+        headers['x-platform-type'] = apiConfig.platform;
+      }
+      if (apiConfig?.gcpProjectId) {
+        headers['x-gcp-project-id'] = apiConfig.gcpProjectId;
+      }
+      if (apiConfig?.gcpLocation) {
+        headers['x-gcp-location'] = apiConfig.gcpLocation;
+      }
+      if (apiConfig?.customEndpoint) {
+        headers['x-custom-endpoint'] = apiConfig.customEndpoint;
+      }
 
       const response = await fetch('/api/translate-subtitles', {
         method: 'POST',
@@ -128,6 +185,7 @@ export const TranscriptDetailView: React.FC<TranscriptDetailViewProps> = ({
           segments: project.segments,
           targetLanguage: langCode,
           targetLanguageName: langName,
+          fileName: project.fileName,
         }),
       });
 
@@ -370,6 +428,20 @@ export const TranscriptDetailView: React.FC<TranscriptDetailViewProps> = ({
                   連續逐字稿模式
                 </button>
               </div>
+
+              <button
+                type="button"
+                onClick={handleConvertToTraditional}
+                title="一鍵將所有簡體字幕及重點摘要轉換為標準正體繁體中文"
+                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-indigo-950/70 hover:bg-indigo-900/80 border border-indigo-700/50 text-indigo-300 text-xs transition-colors"
+              >
+                {convertedFeedback ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                )}
+                <span>{convertedFeedback ? '已轉為正體！' : '一鍵轉正體繁體'}</span>
+              </button>
 
               <button
                 type="button"

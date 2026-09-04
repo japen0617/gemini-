@@ -125,10 +125,26 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
                 }`}
               >
                 {activePlatform === 'agent_platform'
-                  ? 'Vertex AI / Agent Platform'
+                  ? 'Agent Platform'
                   : activePlatform === 'gemini_api'
                   ? 'Google AI Studio'
                   : '智慧自動路由'}
+              </span>
+
+              {/* Active Model Pill */}
+              <span
+                className={`inline-flex items-center space-x-1 text-[11px] font-mono px-2 py-0.5 rounded-full border ${
+                  isVertex
+                    ? 'bg-purple-900/40 border-purple-500/40 text-purple-200'
+                    : 'bg-indigo-900/40 border-indigo-500/40 text-indigo-200'
+                }`}
+              >
+                <Sparkles className="w-3 h-3 text-purple-400" />
+                <span>
+                  {isVertex
+                    ? 'Gemini 3.5 Transcribe Preview (15分音訊/global)'
+                    : 'Gemini 2.5 Flash (繁中優化)'}
+                </span>
               </span>
 
               {/* Status pill */}
@@ -145,8 +161,8 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
               )}
             </div>
 
-            <p className="text-[11px] text-slate-400 flex items-center space-x-1.5">
-              <span>金鑰憑證來源：</span>
+            <p className="text-[11px] text-slate-400 flex items-center space-x-1.5 flex-wrap">
+              <span>金鑰憑證：</span>
               <span className="text-slate-300 font-mono">
                 {apiConfig.apiKey
                   ? `自訂 (${apiConfig.apiKey.slice(0, 6)}••••${apiConfig.apiKey.slice(-4)})`
@@ -154,6 +170,9 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
               </span>
               {apiConfig.gcpProjectId && isVertex && (
                 <span className="text-purple-300">· 專案: {apiConfig.gcpProjectId}</span>
+              )}
+              {isVertex && (
+                <span className="text-slate-400">· 區域: {apiConfig.gcpLocation || 'global'}</span>
               )}
             </p>
           </div>

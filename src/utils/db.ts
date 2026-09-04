@@ -166,6 +166,46 @@ export async function deleteProjectFromDB(id: string): Promise<void> {
   }
 }
 
+export async function deleteMultipleProjectsFromDB(ids: string[]): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  const idSet = new Set(ids);
+  try {
+    const db = await openDB();
+    const tx = db.transaction([STORE_PROJECTS, STORE_AUDIO], 'readwrite');
+    const projectStore = tx.objectStore(STORE_PROJECTS);
+    const audioStore = tx.objectStore(STORE_AUDIO);
+
+    for (const id of ids) {
+      projectStore.delete(id);
+      audioStore.delete(id);
+    }
+
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    const existing = getAllProjectsFromStorage().filter((p) => !idSet.has(p.id));
+    localStorage.setItem('audioscribe_projects', JSON.stringify(existing));
+  }
+}
+
+export async function clearAllProjectsFromDB(): Promise<void> {
+  try {
+    const db = await openDB();
+    const tx = db.transaction([STORE_PROJECTS, STORE_AUDIO], 'readwrite');
+    tx.objectStore(STORE_PROJECTS).clear();
+    tx.objectStore(STORE_AUDIO).clear();
+
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    localStorage.removeItem('audioscribe_projects');
+  }
+}
+
 function getAllProjectsFromStorage(): TranscriptionProject[] {
   try {
     const raw = localStorage.getItem('audioscribe_projects');

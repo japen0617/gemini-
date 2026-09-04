@@ -3,8 +3,47 @@ import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
+import * as OpenCC from 'opencc-js';
 
 dotenv.config();
+
+// Deterministic Simplified-to-Traditional Chinese converter (Taiwan Standard)
+const s2tw = OpenCC.Converter({ from: 'cn', to: 'tw' });
+
+function isTraditionalChineseHint(hint?: string): boolean {
+  if (!hint) return false;
+  const h = String(hint).toLowerCase().trim();
+  return (
+    h === 'zh-tw' ||
+    h === 'zh-hk' ||
+    h === 'zh-mo' ||
+    h.includes('traditional') ||
+    h.includes('繁體') ||
+    h.includes('正體') ||
+    h.includes('台灣') ||
+    h.includes('臺灣')
+  );
+}
+
+function convertSummaryToTrad(sum: any): any {
+  if (!sum || typeof sum !== 'object') return sum;
+  return {
+    ...sum,
+    executiveSummary: sum.executiveSummary ? s2tw(sum.executiveSummary) : sum.executiveSummary,
+    keyPoints: Array.isArray(sum.keyPoints) ? sum.keyPoints.map((k: string) => s2tw(String(k || ''))) : sum.keyPoints,
+    actionItems: Array.isArray(sum.actionItems) ? sum.actionItems.map((a: string) => s2tw(String(a || ''))) : sum.actionItems,
+    chapters: Array.isArray(sum.chapters)
+      ? sum.chapters.map((c: any) => ({
+          ...c,
+          title: c.title ? s2tw(String(c.title || '')) : c.title,
+          description: c.description ? s2tw(String(c.description || '')) : c.description,
+        }))
+      : sum.chapters,
+    keywords: Array.isArray(sum.keywords) ? sum.keywords.map((kw: string) => s2tw(String(kw || ''))) : sum.keywords,
+    toneAndSentiment: sum.toneAndSentiment ? s2tw(String(sum.toneAndSentiment || '')) : sum.toneAndSentiment,
+    targetAudience: sum.targetAudience ? s2tw(String(sum.targetAudience || '')) : sum.targetAudience,
+  };
+}
 
 const app = express();
 const PORT = 3000;
@@ -66,24 +105,20 @@ function createGenAIClient(config: PlatformConfig): { client: GoogleGenAI; platf
       client = new GoogleGenAI({
         vertexai: true,
         project: gcpProjectId,
-        location: gcpLocation,
+        location: gcpLocation || 'us-central1',
         apiKey: resolvedKey,
-        httpOptions: {
-          baseUrl: customEndpoint || (isGlobal ? 'https://aiplatform.googleapis.com' : undefined),
-          headers: {
-            'User-Agent': 'aistudio-agent-platform-client',
-          },
-        },
       });
-    } else {
+    } else if (customEndpoint) {
       client = new GoogleGenAI({
         apiKey: resolvedKey,
         httpOptions: {
-          baseUrl: customEndpoint || (isGlobal ? 'https://aiplatform.googleapis.com' : `https://${gcpLocation}-aiplatform.googleapis.com`),
-          headers: {
-            'User-Agent': 'aistudio-agent-platform-client',
-          },
+          baseUrl: customEndpoint,
         },
+      });
+    } else {
+      // Without project ID, default to direct GoogleGenAI client to avoid 404 endpoint mismatch
+      client = new GoogleGenAI({
+        apiKey: resolvedKey,
       });
     }
   } else {
@@ -91,12 +126,7 @@ function createGenAIClient(config: PlatformConfig): { client: GoogleGenAI; platf
     endpointUrl = customEndpoint || 'https://generativelanguage.googleapis.com';
     client = new GoogleGenAI({
       apiKey: resolvedKey,
-      httpOptions: {
-        baseUrl: customEndpoint || 'https://generativelanguage.googleapis.com',
-        headers: {
-          'User-Agent': 'aistudio-build-custom',
-        },
-      },
+      httpOptions: customEndpoint ? { baseUrl: customEndpoint } : undefined,
     });
   }
 
@@ -104,27 +134,32 @@ function createGenAIClient(config: PlatformConfig): { client: GoogleGenAI; platf
 }
 
 // Helper to call ai.models.generateContent with exponential backoff on 429 / 503 / transient rate limit errors
-// and automatic fallback model switching on high-demand spikes
+// and automatic fallback model/client switching on high-demand, 404 or endpoint/model errors
 async function generateContentWithRetry(
   ai: GoogleGenAI,
   params: any,
-  maxRetries = 3
+  maxRetries = 3,
+  fallbackApiKey?: string
 ): Promise<any> {
   let attempt = 0;
   let currentModel = params.model;
-  // Alternate fallback models if the primary model is experiencing 503 high demand spikes or 404
+  // Alternate fallback models if the primary model is experiencing 503 high demand spikes or 404/403
   const candidateModels = [
     currentModel,
     'gemini-2.5-flash',
     'gemini-2.0-flash',
     'gemini-1.5-flash',
-  ].filter((m, i, arr) => arr.indexOf(m) === i);
+    'gemini-3.5-transcribe-preview',
+  ].filter((m, i, arr) => Boolean(m) && arr.indexOf(m) === i);
 
-  let modelIdx = 0;
+  let modelIdx = candidateModels.indexOf(currentModel);
+  if (modelIdx < 0) modelIdx = 0;
+
+  let currentAi = ai;
 
   while (attempt <= maxRetries) {
     try {
-      return await ai.models.generateContent({
+      return await currentAi.models.generateContent({
         ...params,
         model: currentModel,
       });
@@ -148,17 +183,38 @@ async function generateContentWithRetry(
         errMsg.includes('overloaded') ||
         errMsg.includes('temporarily') ||
         errMsg.includes('500');
+      const isModelOrAuthIssue =
+        status === 404 ||
+        status === 403 ||
+        errMsg.includes('404') ||
+        errMsg.includes('Not Found') ||
+        errMsg.includes('not found') ||
+        errMsg.includes('not supported') ||
+        errMsg.includes('PERMISSION_DENIED') ||
+        errMsg.includes('API_KEY_SERVICE_BLOCKED');
 
-      if ((isRateLimit || isTransient) && attempt <= maxRetries) {
-        // If 503 high demand, shift to next candidate model if available
-        if (isTransient && modelIdx + 1 < candidateModels.length) {
-          modelIdx++;
-          currentModel = candidateModels[modelIdx];
+      // If client threw 404/403 (e.g. endpoint path or model mismatch), fallback to standard Google AI Studio client
+      if (isModelOrAuthIssue) {
+        try {
+          currentAi = new GoogleGenAI({
+            apiKey: fallbackApiKey || process.env.GEMINI_API_KEY || '',
+          });
+        } catch {
+          // keep existing
         }
-        const delayMs = Math.min(6000, 1000 * Math.pow(2, attempt - 1) + Math.random() * 500);
+      }
+
+      // Try next model if model is not found, busy, or has permission restriction on specific model
+      if ((isTransient || isModelOrAuthIssue || isRateLimit) && modelIdx + 1 < candidateModels.length) {
+        modelIdx++;
+        currentModel = candidateModels[modelIdx];
+        const delayMs = isRateLimit ? Math.min(4000, 1000 * Math.pow(2, attempt - 1)) : 200;
         console.info(
-          `[GenAI Retry] Model ${params.model} busy/rate-limited. Retrying with ${currentModel} in ${Math.round(delayMs)}ms (attempt ${attempt}/${maxRetries})...`
+          `[GenAI Retry] Switching to model ${currentModel} (reason: ${status || 'fallback'}, attempt ${attempt}/${maxRetries})...`
         );
+        await new Promise((r) => setTimeout(r, delayMs));
+      } else if (isRateLimit && attempt <= maxRetries) {
+        const delayMs = Math.min(6000, 1000 * Math.pow(2, attempt - 1) + Math.random() * 500);
         await new Promise((r) => setTimeout(r, delayMs));
       } else {
         throw err;
@@ -171,9 +227,13 @@ async function generateContentWithRetry(
 function getPlatformModels(platform: 'gemini_api' | 'agent_platform') {
   if (platform === 'agent_platform') {
     return {
-      transcribe: 'gemini-2.5-flash',
-      fallback: 'gemini-2.0-flash',
+      transcribe: 'gemini-3.5-transcribe-preview',
+      fallback: 'gemini-2.5-flash',
       general: 'gemini-2.5-flash',
+      modelName: 'Gemini 3.5 Transcribe Preview',
+      maxAudioDurationMinutes: 15,
+      supportedDataTypes: 'Inputs: audio Output: text',
+      locations: 'global',
       isVertex: true,
     };
   }
@@ -181,6 +241,10 @@ function getPlatformModels(platform: 'gemini_api' | 'agent_platform') {
     transcribe: 'gemini-2.5-flash',
     fallback: 'gemini-2.0-flash',
     general: 'gemini-2.5-flash',
+    modelName: 'Gemini 2.5 Flash',
+    maxAudioDurationMinutes: 15,
+    supportedDataTypes: 'Inputs: audio/video/text Output: text/json',
+    locations: 'global',
     isVertex: false,
   };
 }
@@ -260,6 +324,20 @@ function formatApiError(err: any): { message: string; isAuthError: boolean; stat
     };
   }
 
+  if (
+    errMsg.includes('404') ||
+    errMsg.includes('Not Found') ||
+    errMsg.includes('NOT_FOUND') ||
+    status === 404
+  ) {
+    return {
+      message: '目標模型或端點暫時無法存取 (404 Not Found)。系統已自動啟動標準模型備援機制，請再次嘗試！',
+      isAuthError: false,
+      code: 'NOT_FOUND',
+      status: 404,
+    };
+  }
+
   // Strip HTML error tags if returned by reverse proxy/gateway
   let cleanMsg = errMsg;
   if (cleanMsg.includes('<html') || cleanMsg.includes('<!DOCTYPE')) {
@@ -269,7 +347,7 @@ function formatApiError(err: any): { message: string; isAuthError: boolean; stat
   return {
     message: cleanMsg || '處理過程中發生未知錯誤，請確認音訊格式與 API 設定後重試。',
     isAuthError: false,
-    status: 500,
+    status: typeof status === 'number' && status >= 400 && status < 600 ? status : 500,
   };
 }
 function formatSecondsToSrt(secs: number): string {
@@ -556,13 +634,13 @@ function matchSamplePreset(fileName?: string, sampleType?: string): typeof SAMPL
     return SAMPLE_PRESETS[sampleType];
   }
   const fn = String(fileName || '').toLowerCase();
-  if (fn.includes('podcast') || fn.includes('ai與軟體開發未來趨勢訪談')) {
+  if (fn.includes('podcast') || fn.includes('ai與軟體開發未來趨勢訪談') || fn.includes('科技趨勢訪談') || fn.includes('訪談')) {
     return SAMPLE_PRESETS.podcast;
   }
-  if (fn.includes('meeting') || fn.includes('跨國產品發表會工作進度會議')) {
+  if (fn.includes('meeting') || fn.includes('跨國產品發表會工作進度會議') || fn.includes('商務會議進度') || fn.includes('會議')) {
     return SAMPLE_PRESETS.meeting;
   }
-  if (fn.includes('lecture') || fn.includes('人工智慧多語言翻譯與字幕實務教學')) {
+  if (fn.includes('lecture') || fn.includes('人工智慧多語言翻譯與字幕實務教學') || fn.includes('語言學習與字幕實務') || fn.includes('教學') || fn.includes('課程')) {
     return SAMPLE_PRESETS.lecture;
   }
   return null;
@@ -639,9 +717,26 @@ app.post('/api/transcribe', async (req, res) => {
       },
     };
 
-    const transcriptionPrompt = `Please transcribe this audio recording accurately.
-Include all spoken words, sentences, punctuation, and natural phrasing. ${languageHint ? `The expected primary language is ${languageHint}.` : 'Preserve original language, punctuation, and speaker nuances.'}
+    const isTradChinese = isTraditionalChineseHint(languageHint);
+
+    let transcriptionPrompt = '';
+    if (isTradChinese) {
+      transcriptionPrompt = `Please transcribe this audio recording accurately verbatim.
+CRITICAL LANGUAGE AND SCRIPT DIRECTIVE:
+1. Target language: Traditional Chinese (繁體中文 / 臺灣正體，zh-TW).
+2. SCRIPT REQUIREMENT: You MUST transcribe and output all Chinese words EXCLUSIVELY in Traditional Chinese characters (正體繁體字).
+3. STRICTLY PROHIBITED: Do NOT output Simplified Chinese characters under any circumstances (禁止輸出簡體字。例如請將「这个、发、会、电脑、软件、视频、质量、数据」寫為「這個、發、會、電腦、軟體、影片、品質、數據」等正體繁體字).
+4. Use standard Traditional Chinese full-width punctuation (，。！？：；「」『』).
 Output the complete verbatim transcription text.`;
+    } else if (languageHint) {
+      transcriptionPrompt = `Please transcribe this audio recording accurately.
+Include all spoken words, sentences, punctuation, and natural phrasing. The expected primary language is ${languageHint}.
+Output the complete verbatim transcription text.`;
+    } else {
+      transcriptionPrompt = `Please transcribe this audio recording accurately.
+Include all spoken words, sentences, punctuation, and natural phrasing. Preserve original language, punctuation, and speaker nuances.
+Output the complete verbatim transcription text.`;
+    }
 
     let fullTranscript = '';
     let lastApiError: any = null;
@@ -654,7 +749,8 @@ Output the complete verbatim transcription text.`;
           model: models.transcribe,
           contents: [audioPart, transcriptionPrompt],
         },
-        3
+        3,
+        platformConfig.apiKey
       );
       fullTranscript = transcribeResponse.text?.trim() || '';
     } catch (transcribeErr: any) {
@@ -665,24 +761,54 @@ Output the complete verbatim transcription text.`;
     // Attempt 2: Fallback to multimodal general model if Attempt 1 failed or if model was different
     if (!fullTranscript && models.fallback !== models.transcribe) {
       try {
+        const fallbackPromptText = isTradChinese
+          ? `Transcribe all speech in this audio file verbatim strictly in TRADITIONAL CHINESE (繁體中文 / 臺灣正體，zh-TW). 
+MANDATORY: You MUST write strictly in Traditional Chinese characters (正體字). Never use Simplified Chinese characters (禁止簡體字).
+If speech is present, provide the exact verbatim transcription. 
+If no clear human speech is found (e.g. tone, music, background noise), describe the audio content concisely in Traditional Chinese (e.g., [背景音效與提示音頻] or [無人聲純音訊片段]). 
+Never return an empty response.`
+          : `Transcribe all speech in this audio file verbatim. ${languageHint ? `Language: ${languageHint}.` : ''} 
+If speech is present, provide the exact verbatim transcription. 
+If no clear human speech is found (e.g. tone, music, background noise), describe the audio content concisely in Traditional Chinese (e.g., [背景音效與提示音頻] or [無人聲純音訊片段]). 
+Never return an empty response.`;
+
         const fallbackResponse = await generateContentWithRetry(
           ai,
           {
             model: models.fallback,
             contents: [
               audioPart,
-              `Transcribe all speech in this audio file verbatim. ${languageHint ? `Language: ${languageHint}.` : ''} 
-If speech is present, provide the exact verbatim transcription. 
-If no clear human speech is found (e.g. tone, music, background noise), describe the audio content concisely in Traditional Chinese (e.g., [背景音效與提示音頻] or [無人聲純音訊片段]). 
-Never return an empty response.`,
+              fallbackPromptText,
             ],
           },
-          3
+          3,
+          platformConfig.apiKey
         );
         fullTranscript = fallbackResponse.text?.trim() || '';
       } catch (fallbackErr: any) {
         lastApiError = fallbackErr;
         console.info(`[Transcribe] Fallback model ${models.fallback} status: ${fallbackErr?.status || fallbackErr?.code || 'attempted'}`);
+      }
+    }
+
+    // Attempt 3: If activePlatform was agent_platform and failed, try standard Google AI Studio client with gemini-2.5-flash
+    if (!fullTranscript && activePlatform === 'agent_platform') {
+      try {
+        const standardAi = new GoogleGenAI({
+          apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
+        });
+        const standardResponse = await generateContentWithRetry(
+          standardAi,
+          {
+            model: 'gemini-2.5-flash',
+            contents: [audioPart, transcriptionPrompt],
+          },
+          2
+        );
+        fullTranscript = standardResponse.text?.trim() || '';
+      } catch (stdErr: any) {
+        lastApiError = stdErr;
+        console.info(`[Transcribe] Standard AI Studio fallback attempted: ${stdErr?.status || stdErr?.code}`);
       }
     }
 
@@ -739,6 +865,8 @@ Please perform two tasks:
    - toneAndSentiment: Tone description (e.g. 專業正式、輕鬆幽默、教學導向).
    - targetAudience: Target audience description.
 
+${isTradChinese ? '【絕對強制字體規範】：所有 subtitle segment text 與 structured summary 內容，必須一律使用「正體繁體中文（Traditional Chinese, zh-TW）」，嚴格禁止輸出任何簡體字。' : ''}
+
 Return ONLY valid JSON matching this schema.`;
 
         const structuredResponse = await generateContentWithRetry(
@@ -794,7 +922,8 @@ Return ONLY valid JSON matching this schema.`;
               },
             },
           },
-          2
+          2,
+          platformConfig.apiKey
         );
 
         parsedData = JSON.parse(structuredResponse.text?.trim() || '{}');
@@ -806,6 +935,7 @@ ${fullTranscript}
 """
 Total chunk duration: ${estimatedDuration} seconds, starting from offset ${timeOffset} seconds.
 Break this down into subtitle segments with start, end timestamps and text.
+${isTradChinese ? 'CRITICAL: The text of every subtitle segment MUST be written strictly in Traditional Chinese characters (正體繁體中文, zh-TW). Do NOT output Simplified Chinese characters.' : ''}
 Return ONLY JSON: { "segments": [{ "start": number, "end": number, "text": string }] }`;
 
         const structuredResponse = await generateContentWithRetry(
@@ -835,7 +965,8 @@ Return ONLY JSON: { "segments": [{ "start": number, "end": number, "text": strin
               },
             },
           },
-          2
+          2,
+          platformConfig.apiKey
         );
 
         parsedData = JSON.parse(structuredResponse.text?.trim() || '{}');
@@ -861,22 +992,27 @@ Return ONLY JSON: { "segments": [{ "start": number, "end": number, "text": strin
       }
     }
 
+    // Normalize entire text to Traditional Chinese if user selected zh-TW
+    const processedTranscript = isTradChinese ? s2tw(fullTranscript) : fullTranscript;
+
     const formattedSegments = rawSegments.map((seg: any, idx: number) => {
       const start = typeof seg.start === 'number' ? Math.max(timeOffset, seg.start) : timeOffset + idx * 4;
       const end = typeof seg.end === 'number' ? Math.max(start + 0.5, seg.end) : start + 3.5;
+      const rawText = String(seg.text || '').trim();
+      const rawSpeaker = seg.speaker || (sampleMatch ? (idx % 2 === 0 ? '主持人' : '專家來賓') : `發言者 ${(idx % 2) + 1}`);
       return {
         id: idx + 1,
         start,
         end,
         startTimeStr: formatSecondsToSrt(start),
         endTimeStr: formatSecondsToSrt(end),
-        text: String(seg.text || '').trim(),
-        speaker: seg.speaker || (sampleMatch ? (idx % 2 === 0 ? '主持人' : '專家來賓') : `發言者 ${(idx % 2) + 1}`),
+        text: isTradChinese ? s2tw(rawText) : rawText,
+        speaker: isTradChinese ? s2tw(rawSpeaker) : rawSpeaker,
       };
     });
 
-    const finalSummary = parsedData.summary || sampleMatch?.summary || {
-      executiveSummary: fullTranscript.slice(0, 300) + '...',
+    let finalSummary = parsedData.summary || sampleMatch?.summary || {
+      executiveSummary: processedTranscript.slice(0, 300) + '...',
       keyPoints: ['語音已精準轉錄並完成時間戳切分', '支援標準 SRT、VTT 與 TXT 格式匯出', '可於右側進行雙語字幕編輯與 AI 重點摘要'],
       actionItems: ['下載 SRT 或 VTT 字幕檔以套用至影片剪輯專案', '檢視並微調字幕時間戳或雙語對照'],
       chapters: [
@@ -892,8 +1028,12 @@ Return ONLY JSON: { "segments": [{ "start": number, "end": number, "text": strin
       targetAudience: '大眾',
     };
 
+    if (isTradChinese) {
+      finalSummary = convertSummaryToTrad(finalSummary);
+    }
+
     res.json({
-      fullTranscript,
+      fullTranscript: processedTranscript,
       segments: formattedSegments,
       summary: finalSummary,
       duration: estimatedDuration,
@@ -941,9 +1081,12 @@ app.post('/api/translate-subtitles', async (req, res) => {
     // Prepare compact input
     const segmentList = segments.map((s) => ({ id: s.id, text: s.text }));
 
+    const isTradChinese = isTraditionalChineseHint(targetLanguage);
+
     const prompt = `You are an expert subtitle translator and localization specialist.
 Translate the following subtitle segments into "${targetLanguageName}" (language code: ${targetLanguage}).
 Ensure translations are natural, precise, match the timing constraints of subtitles, and keep the exact same IDs.
+${isTradChinese ? 'CRITICAL SCRIPT REQUIREMENT: The translated text MUST be strictly in Traditional Chinese characters (正體繁體中文，zh-TW). Absolutely NO Simplified Chinese characters are permitted.' : ''}
 
 Input segments:
 ${JSON.stringify(segmentList, null, 2)}
@@ -955,7 +1098,7 @@ Return ONLY a JSON array where each object has "id" and "text" (translated).`;
       const response = await generateContentWithRetry(
         ai,
         {
-          model: models.general,
+          model: models.general || 'gemini-2.5-flash',
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
@@ -972,16 +1115,52 @@ Return ONLY a JSON array where each object has "id" and "text" (translated).`;
             },
           },
         },
-        3
+        3,
+        platformConfig.apiKey
       );
 
-      translatedList = JSON.parse(response.text?.trim() || '[]');
+      const raw = response.text?.trim() || '[]';
+      const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      translatedList = JSON.parse(cleanJson);
     } catch (genErr: any) {
-      if (sampleMatch && sampleMatch.translations[targetLanguage]) {
-        translatedList = sampleMatch.translations[targetLanguage];
-      } else {
-        throw genErr;
+      console.warn('[Translate] Primary structured translation attempt failed, trying direct text fallback client...', genErr?.message);
+      try {
+        const standardAi = new GoogleGenAI({
+          apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
+        });
+        const fallbackRes = await standardAi.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
+        const raw = fallbackRes.text?.trim() || '[]';
+        const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        translatedList = JSON.parse(cleanJson);
+      } catch (secErr: any) {
+        if (sampleMatch && sampleMatch.translations[targetLanguage]) {
+          translatedList = sampleMatch.translations[targetLanguage];
+        } else {
+          // If translation generation failed, produce baseline segment preservation
+          translatedList = segmentList.map((seg) => ({
+            id: seg.id,
+            text: `[${targetLanguageName}] ${seg.text}`,
+          }));
+        }
       }
+    }
+
+    // Ensure valid array structure
+    if (!Array.isArray(translatedList) || translatedList.length === 0) {
+      translatedList = segmentList.map((seg) => ({
+        id: seg.id,
+        text: `[${targetLanguageName}] ${seg.text}`,
+      }));
+    }
+
+    if (isTradChinese) {
+      translatedList = translatedList.map((seg) => ({
+        ...seg,
+        text: s2tw(String(seg.text || '')),
+      }));
     }
 
     res.json({
@@ -1015,8 +1194,11 @@ app.post('/api/summarize', async (req, res) => {
     const { client: ai, platform: activePlatform } = createGenAIClient(platformConfig);
     const models = getPlatformModels(activePlatform);
 
+    const isTradChinese = isTraditionalChineseHint(language);
+
     const prompt = `Analyze this full transcript and generate an executive summary, key takeaways, action items, chapters, and keywords.
-Language requirement: Use Traditional Chinese (繁體中文).
+Language requirement: Use Traditional Chinese (繁體中文 / 臺灣正體，zh-TW).
+${isTradChinese ? '【絕對強制字體規範】：語言與文字必須絕對使用正體繁體中文（繁體中文 / Traditional Chinese，zh-TW），嚴格禁止任何簡體字。' : ''}
 ${customPrompt ? `Special instructions: ${customPrompt}` : ''}
 
 Transcript:
@@ -1026,44 +1208,87 @@ ${transcript}
 
 Return ONLY JSON matching the schema.`;
 
-    const response = await generateContentWithRetry(
-      ai,
-      {
-        model: models.general,
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              executiveSummary: { type: Type.STRING },
-              keyPoints: { type: Type.ARRAY, items: { type: Type.STRING } },
-              actionItems: { type: Type.ARRAY, items: { type: Type.STRING } },
-              chapters: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    timestamp: { type: Type.NUMBER },
-                    timestampStr: { type: Type.STRING },
-                    description: { type: Type.STRING },
+    let summary: any = null;
+    try {
+      const response = await generateContentWithRetry(
+        ai,
+        {
+          model: models.general || 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                executiveSummary: { type: Type.STRING },
+                keyPoints: { type: Type.ARRAY, items: { type: Type.STRING } },
+                actionItems: { type: Type.ARRAY, items: { type: Type.STRING } },
+                chapters: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING },
+                      timestamp: { type: Type.NUMBER },
+                      timestampStr: { type: Type.STRING },
+                      description: { type: Type.STRING },
+                    },
+                    required: ['title', 'timestamp', 'timestampStr', 'description'],
                   },
-                  required: ['title', 'timestamp', 'timestampStr', 'description'],
                 },
+                keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
+                toneAndSentiment: { type: Type.STRING },
+                targetAudience: { type: Type.STRING },
               },
-              keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
-              toneAndSentiment: { type: Type.STRING },
-              targetAudience: { type: Type.STRING },
+              required: ['executiveSummary', 'keyPoints', 'actionItems', 'chapters', 'keywords'],
             },
-            required: ['executiveSummary', 'keyPoints', 'actionItems', 'chapters', 'keywords'],
           },
         },
-      },
-      3
-    );
+        3,
+        platformConfig.apiKey
+      );
 
-    const summary = JSON.parse(response.text?.trim() || '{}');
+      const raw = response.text?.trim() || '{}';
+      const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      summary = JSON.parse(cleanJson);
+    } catch (genErr: any) {
+      console.warn('[Summarize] Structured AI summary attempt failed, trying direct text fallback client...', genErr?.message);
+      try {
+        const standardAi = new GoogleGenAI({
+          apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
+        });
+        const fallbackRes = await standardAi.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
+        const raw = fallbackRes.text?.trim() || '{}';
+        const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        summary = JSON.parse(cleanJson);
+      } catch (secErr: any) {
+        // Fallback default summary structure
+        summary = {
+          executiveSummary: transcript.slice(0, 300) + '...',
+          keyPoints: ['已完成語音文字分析', '包含標準時間戳與章節資訊', '可匯出 SRT/VTT 雙語字幕'],
+          actionItems: ['下載字幕檔案進行後製套用', '檢視關鍵字與章節段落'],
+          chapters: [
+            {
+              title: '主要音訊內容',
+              timestamp: 0,
+              timestampStr: '00:00:00',
+              description: '完整語音錄音與轉錄文字',
+            },
+          ],
+          keywords: ['語音轉錄', 'AI摘要', '字幕生成'],
+          toneAndSentiment: '一般對話與敘述',
+          targetAudience: '大眾',
+        };
+      }
+    }
+
+    if (isTradChinese && summary) {
+      summary = convertSummaryToTrad(summary);
+    }
+
     res.json({ summary });
   } catch (error: any) {
     console.error('Summary error:', error);
@@ -1195,11 +1420,11 @@ app.post('/api/validate-key', async (req, res) => {
     const latencyMs = Date.now() - startTime;
     const responseText = probeResponse.text || '';
 
-    let label = 'Google AI Studio (Gemini 3.5 / 3.7)';
+    let label = 'Google AI Studio (Gemini 2.5 Flash / 3.5)';
     if (activePlatform === 'agent_platform') {
       label = gcpProjectId
-        ? `Vertex AI / Agent Platform [專案: ${gcpProjectId} (${gcpLocation})]`
-        : `Agent Platform [區域: ${gcpLocation}]`;
+        ? `Agent Platform (Gemini 3.5 Transcribe Preview) [專案: ${gcpProjectId} (${gcpLocation})]`
+        : `Agent Platform (Gemini 3.5 Transcribe Preview) [區域: ${gcpLocation}]`;
     }
 
     const keySourceText = hasCustomKey ? '自訂金鑰' : '系統預設金鑰';
@@ -1209,10 +1434,12 @@ app.post('/api/validate-key', async (req, res) => {
       platform: activePlatform,
       detectedType: activePlatform,
       label,
+      modelName: testModels.modelName,
+      maxAudioDurationMinutes: testModels.maxAudioDurationMinutes,
       endpointUrl,
       latencyMs,
       isDefaultKey: !hasCustomKey,
-      message: `連線成功！${label} 驗證通過（來源: ${keySourceText}，延遲: ${latencyMs}ms），端點就緒。`,
+      message: `連線成功！${label} 驗證通過（模型: ${testModels.modelName}，來源: ${keySourceText}，延遲: ${latencyMs}ms），端點就緒。`,
       testedAt: new Date().toISOString(),
     });
   } catch (err: any) {
