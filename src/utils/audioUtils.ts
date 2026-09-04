@@ -7,6 +7,8 @@ export interface AudioMetadata {
   durationFormatted: string;
   isOver30Minutes: boolean;
   suggestedChunkCount: number;
+  chunkDurationMinutes?: number;
+  chunkDurationSec?: number;
   sampleRate: number;
   channels: number;
   fileSize: number;
@@ -109,7 +111,7 @@ export function isVideoFile(fileOrType: File | Blob | string): boolean {
 /**
  * Inspect Audio or Video duration and basic metadata
  */
-export async function getAudioMetadata(file: File | Blob): Promise<AudioMetadata> {
+export async function getAudioMetadata(file: File | Blob, chunkDurationMinutes: number = 3): Promise<AudioMetadata> {
   let duration = 0;
   let sampleRate = 44100;
   let channels = 2;
@@ -279,9 +281,12 @@ export async function getAudioMetadata(file: File | Blob): Promise<AudioMetadata
     duration = isVideo ? Math.max(1, file.size / (128 * 1024)) : Math.max(1, file.size / (16 * 1024));
   }
 
-  // Any audio/video longer than 3 minutes (180s) or file size > 8MB triggers smart chunking to prevent 413 errors
-  const isOver30Minutes = duration > 180 || file.size > 8 * 1024 * 1024;
-  const CHUNK_DURATION = 180; // 3 mins per chunk (16kHz mono = ~5.7MB WAV, highly stable for all APIs)
+  // Calculate chunk duration based on user custom setting (minimum 30 seconds, default 180s/3min)
+  const safeMinutes = Math.max(0.5, Math.min(15, chunkDurationMinutes || 3));
+  const CHUNK_DURATION = Math.round(safeMinutes * 60);
+
+  // Audio/video longer than the chunk threshold or file size > 8MB triggers smart chunking
+  const isOver30Minutes = duration > CHUNK_DURATION || file.size > 8 * 1024 * 1024;
   const suggestedChunkCount = isOver30Minutes ? Math.max(1, Math.ceil(duration / CHUNK_DURATION)) : 1;
 
   return {
@@ -289,6 +294,8 @@ export async function getAudioMetadata(file: File | Blob): Promise<AudioMetadata
     durationFormatted: formatAudioTime(duration),
     isOver30Minutes,
     suggestedChunkCount,
+    chunkDurationMinutes: safeMinutes,
+    chunkDurationSec: CHUNK_DURATION,
     sampleRate,
     channels,
     fileSize: file.size,

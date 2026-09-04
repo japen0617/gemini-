@@ -162,20 +162,33 @@ export const TranscriptDetailView: React.FC<TranscriptDetailViewProps> = ({
     setIsTranslating(true);
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (apiConfig?.apiKey) {
-        headers['x-gemini-api-key'] = apiConfig.apiKey;
+      const activePlatform = apiConfig?.platform || 'gemini_api';
+      const activeKey =
+        activePlatform === 'agent_platform'
+          ? (apiConfig?.agentPlatformKey || apiConfig?.apiKey || '')
+          : (apiConfig?.geminiApiKey || apiConfig?.apiKey || '');
+
+      if (activeKey.trim()) {
+        headers['x-gemini-api-key'] = activeKey.trim();
       }
-      if (apiConfig?.platform) {
-        headers['x-platform-type'] = apiConfig.platform;
+      if (apiConfig?.geminiApiKey?.trim()) {
+        headers['x-ai-studio-key'] = apiConfig.geminiApiKey.trim();
       }
-      if (apiConfig?.gcpProjectId) {
-        headers['x-gcp-project-id'] = apiConfig.gcpProjectId;
+      if (apiConfig?.agentPlatformKey?.trim()) {
+        headers['x-agent-platform-key'] = apiConfig.agentPlatformKey.trim();
       }
-      if (apiConfig?.gcpLocation) {
-        headers['x-gcp-location'] = apiConfig.gcpLocation;
-      }
-      if (apiConfig?.customEndpoint) {
-        headers['x-custom-endpoint'] = apiConfig.customEndpoint;
+      headers['x-platform-type'] = activePlatform;
+
+      if (activePlatform === 'agent_platform') {
+        if (apiConfig?.gcpProjectId) {
+          headers['x-gcp-project-id'] = apiConfig.gcpProjectId;
+        }
+        if (apiConfig?.gcpLocation) {
+          headers['x-gcp-location'] = apiConfig.gcpLocation;
+        }
+        if (apiConfig?.customEndpoint) {
+          headers['x-custom-endpoint'] = apiConfig.customEndpoint;
+        }
       }
 
       const response = await fetch('/api/translate-subtitles', {
@@ -1188,7 +1201,7 @@ export const TranscriptDetailView: React.FC<TranscriptDetailViewProps> = ({
               <span>長音檔分段切割紀錄與時長監控</span>
             </h3>
             <p className="text-xs text-slate-400 mt-1">
-              音訊總時長為 <span className="text-white font-mono">{formatAudioTime(project.duration)}</span>（超過 30 分鐘門檻）。系統已依據 15 分鐘切割週期將音訊切片轉錄，並進行全域時間戳無縫拼接。
+              音訊總時長為 <span className="text-white font-mono">{formatAudioTime(project.duration)}</span>。系統已依據設定的 <span className="text-amber-300 font-semibold">{project.chunkDurationMinutes || 3} 分鐘</span> 切割週期將音訊切片轉錄，並進行全域時間戳無縫拼接。
             </p>
           </div>
 

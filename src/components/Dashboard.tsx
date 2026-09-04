@@ -572,11 +572,11 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
                         {project.isChunked && (
                           <span
-                            title="音訊超過 30 分鐘，已自動分段切割處理"
+                            title={`音訊已分段切割處理 (每段 ${project.chunkDurationMinutes || 3} 分鐘)`}
                             className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[10px] font-semibold shrink-0"
                           >
                             <Scissors className="w-3 h-3" />
-                            <span>已分段</span>
+                            <span>分段 ({project.chunkDurationMinutes || 3}分)</span>
                           </span>
                         )}
                       </div>
@@ -746,8 +746,11 @@ export const Dashboard: React.FC<DashboardProps> = ({
                             {project.title || project.fileName}
                           </span>
                           {project.isChunked && (
-                            <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                              分段
+                            <span
+                              title={`音訊已分段切割處理 (每段 ${project.chunkDurationMinutes || 3} 分鐘)`}
+                              className="px-1.5 py-0.2 rounded text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 font-semibold"
+                            >
+                              分段 ({project.chunkDurationMinutes || 3}分)
                             </span>
                           )}
                         </div>

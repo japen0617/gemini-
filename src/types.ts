@@ -57,6 +57,7 @@ export interface TranscriptionProject {
   updatedAt: string;
   status: 'completed' | 'processing' | 'error';
   isChunked: boolean;
+  chunkDurationMinutes?: number;
   chunksMeta?: AudioChunkMeta[];
   sourceLanguage?: string;
   fullTranscript: string;
@@ -71,7 +72,9 @@ export type PlatformType = 'auto' | 'gemini_api' | 'agent_platform';
 
 export interface ApiConfig {
   platform?: PlatformType;
-  apiKey: string;
+  apiKey: string; // Active key currently used
+  geminiApiKey?: string; // Dedicated key for Google AI Studio
+  agentPlatformKey?: string; // Dedicated key for Agent Platform / Vertex AI
   keyType?: PlatformType; // for backward compatibility
   detectedType?: 'gemini_api' | 'agent_platform';
   gcpProjectId?: string;

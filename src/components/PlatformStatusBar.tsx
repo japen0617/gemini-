@@ -30,13 +30,13 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
     message: string;
   } | null>(null);
 
-  const activePlatform = apiConfig.platform || apiConfig.keyType || 'auto';
-  const isVertex =
-    activePlatform === 'agent_platform' ||
-    (activePlatform === 'auto' && apiConfig.detectedType === 'agent_platform');
-  const isAiStudio =
-    activePlatform === 'gemini_api' ||
-    (activePlatform === 'auto' && apiConfig.detectedType === 'gemini_api');
+  const activePlatform = apiConfig.platform || 'gemini_api';
+  const isVertex = activePlatform === 'agent_platform';
+  const isAiStudio = activePlatform === 'gemini_api';
+
+  const currentPlatformKey = isVertex
+    ? (apiConfig.agentPlatformKey || apiConfig.apiKey || '')
+    : (apiConfig.geminiApiKey || apiConfig.apiKey || '');
 
   const handleQuickPing = async () => {
     setIsTesting(true);
@@ -47,11 +47,13 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          apiKey: apiConfig.apiKey || undefined,
+          apiKey: currentPlatformKey || undefined,
+          geminiApiKey: apiConfig.geminiApiKey || undefined,
+          agentPlatformKey: apiConfig.agentPlatformKey || undefined,
           platform: activePlatform,
-          gcpProjectId: apiConfig.gcpProjectId || undefined,
-          gcpLocation: apiConfig.gcpLocation || 'us-central1',
-          customEndpoint: apiConfig.customEndpoint || undefined,
+          gcpProjectId: isVertex ? apiConfig.gcpProjectId || undefined : undefined,
+          gcpLocation: isVertex ? apiConfig.gcpLocation || 'global' : undefined,
+          customEndpoint: isVertex ? apiConfig.customEndpoint || undefined : undefined,
         }),
       });
 
@@ -98,18 +100,10 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
             className={`w-9 h-9 rounded-xl flex items-center justify-center text-white shrink-0 shadow-md ${
               isVertex
                 ? 'bg-gradient-to-tr from-purple-600 to-indigo-600 shadow-purple-500/20'
-                : isAiStudio
-                ? 'bg-gradient-to-tr from-indigo-600 to-cyan-500 shadow-indigo-500/20'
-                : 'bg-gradient-to-tr from-cyan-600 to-blue-500 shadow-cyan-500/20'
+                : 'bg-gradient-to-tr from-indigo-600 to-cyan-500 shadow-indigo-500/20'
             }`}
           >
-            {isVertex ? (
-              <Layers className="w-4 h-4" />
-            ) : isAiStudio ? (
-              <Cpu className="w-4 h-4" />
-            ) : (
-              <Sparkles className="w-4 h-4" />
-            )}
+            {isVertex ? <Layers className="w-4 h-4" /> : <Cpu className="w-4 h-4" />}
           </div>
 
           <div className="space-y-0.5">
@@ -119,19 +113,13 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
                 className={`text-xs font-bold px-2 py-0.5 rounded-full border ${
                   isVertex
                     ? 'bg-purple-500/20 border-purple-500/40 text-purple-300'
-                    : isAiStudio
-                    ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
-                    : 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                    : 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
                 }`}
               >
-                {activePlatform === 'agent_platform'
-                  ? 'Agent Platform'
-                  : activePlatform === 'gemini_api'
-                  ? 'Google AI Studio'
-                  : '智慧自動路由'}
+                {isVertex ? 'Agent Platform' : 'Google AI Studio'}
               </span>
 
-              {/* Active Model Pill */}
+              {/* Active Model Pill - strictly Gemini 3.5 Transcribe */}
               <span
                 className={`inline-flex items-center space-x-1 text-[11px] font-mono px-2 py-0.5 rounded-full border ${
                   isVertex
@@ -139,11 +127,11 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
                     : 'bg-indigo-900/40 border-indigo-500/40 text-indigo-200'
                 }`}
               >
-                <Sparkles className="w-3 h-3 text-purple-400" />
+                <Sparkles className="w-3 h-3 text-cyan-400" />
                 <span>
                   {isVertex
-                    ? 'Gemini 3.5 Transcribe Preview (15分音訊/global)'
-                    : 'Gemini 2.5 Flash (繁中優化)'}
+                    ? 'Gemini 3.5 Transcribe Preview (15分音訊 / global)'
+                    : 'Gemini 3.5 Transcribe (v1beta 端點)'}
                 </span>
               </span>
 
@@ -164,9 +152,12 @@ export const PlatformStatusBar: React.FC<PlatformStatusBarProps> = ({
             <p className="text-[11px] text-slate-400 flex items-center space-x-1.5 flex-wrap">
               <span>金鑰憑證：</span>
               <span className="text-slate-300 font-mono">
-                {apiConfig.apiKey
-                  ? `自訂 (${apiConfig.apiKey.slice(0, 6)}••••${apiConfig.apiKey.slice(-4)})`
+                {currentPlatformKey
+                  ? `自訂 (${currentPlatformKey.slice(0, 6)}••••${currentPlatformKey.slice(-4)})`
                   : '系統環境預設金鑰 (無需手動配置即可立即使用)'}
+              </span>
+              <span className="text-cyan-400 font-mono text-[10px]">
+                {isAiStudio ? '· 端點: v1beta' : '· 端點: global'}
               </span>
               {apiConfig.gcpProjectId && isVertex && (
                 <span className="text-purple-300">· 專案: {apiConfig.gcpProjectId}</span>

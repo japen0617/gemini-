@@ -37,10 +37,12 @@ export default function App() {
   const [selectedProject, setSelectedProject] = useState<TranscriptionProject | null>(null);
   const [activeAudioBlob, setActiveAudioBlob] = useState<Blob | null>(null);
 
-  // Custom API Key & Model Type State
+  // Custom API Key & Model Type State (Separated for Google AI Studio and Agent Platform)
   const [apiConfig, setApiConfig] = useState<ApiConfig>({
     apiKey: '',
-    keyType: 'auto',
+    geminiApiKey: '',
+    agentPlatformKey: '',
+    platform: 'gemini_api',
   });
   const [isApiSettingsOpen, setIsApiSettingsOpen] = useState<boolean>(false);
 
@@ -59,7 +61,13 @@ export default function App() {
     try {
       const savedConfig = localStorage.getItem(API_CONFIG_STORAGE_KEY);
       if (savedConfig) {
-        setApiConfig(JSON.parse(savedConfig));
+        const parsed = JSON.parse(savedConfig);
+        setApiConfig({
+          ...parsed,
+          platform: parsed.platform || 'gemini_api',
+          geminiApiKey: parsed.geminiApiKey || (parsed.platform === 'gemini_api' ? parsed.apiKey : ''),
+          agentPlatformKey: parsed.agentPlatformKey || (parsed.platform === 'agent_platform' ? parsed.apiKey : ''),
+        });
       }
     } catch (e) {
       console.warn('Failed to load saved API config from localStorage:', e);
@@ -76,7 +84,12 @@ export default function App() {
   };
 
   const handleClearApiConfig = () => {
-    const emptyConfig: ApiConfig = { apiKey: '', keyType: 'auto' };
+    const emptyConfig: ApiConfig = {
+      apiKey: '',
+      geminiApiKey: '',
+      agentPlatformKey: '',
+      platform: 'gemini_api',
+    };
     setApiConfig(emptyConfig);
     try {
       localStorage.removeItem(API_CONFIG_STORAGE_KEY);
@@ -88,22 +101,33 @@ export default function App() {
   // Helper to build headers with custom API key & platform routing if present
   const getRequestHeaders = () => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (apiConfig.apiKey && apiConfig.apiKey.trim()) {
-      headers['x-gemini-api-key'] = apiConfig.apiKey.trim();
+    const activePlatform = apiConfig.platform || 'gemini_api';
+    const activeKey =
+      activePlatform === 'agent_platform'
+        ? (apiConfig.agentPlatformKey || apiConfig.apiKey || '')
+        : (apiConfig.geminiApiKey || apiConfig.apiKey || '');
+
+    if (activeKey.trim()) {
+      headers['x-gemini-api-key'] = activeKey.trim();
     }
-    if (apiConfig.platform) {
-      headers['x-platform-type'] = apiConfig.platform;
-    } else if (apiConfig.keyType) {
-      headers['x-platform-type'] = apiConfig.keyType;
+    if (apiConfig.geminiApiKey?.trim()) {
+      headers['x-ai-studio-key'] = apiConfig.geminiApiKey.trim();
     }
-    if (apiConfig.gcpProjectId) {
-      headers['x-gcp-project-id'] = apiConfig.gcpProjectId;
+    if (apiConfig.agentPlatformKey?.trim()) {
+      headers['x-agent-platform-key'] = apiConfig.agentPlatformKey.trim();
     }
-    if (apiConfig.gcpLocation) {
-      headers['x-gcp-location'] = apiConfig.gcpLocation;
-    }
-    if (apiConfig.customEndpoint) {
-      headers['x-custom-endpoint'] = apiConfig.customEndpoint;
+    headers['x-platform-type'] = activePlatform;
+
+    if (activePlatform === 'agent_platform') {
+      if (apiConfig.gcpProjectId) {
+        headers['x-gcp-project-id'] = apiConfig.gcpProjectId;
+      }
+      if (apiConfig.gcpLocation) {
+        headers['x-gcp-location'] = apiConfig.gcpLocation;
+      }
+      if (apiConfig.customEndpoint) {
+        headers['x-custom-endpoint'] = apiConfig.customEndpoint;
+      }
     }
     return headers;
   };
@@ -231,6 +255,7 @@ export default function App() {
     languageHint: string;
     targetTranslationLang?: string;
     generateSummary: boolean;
+    chunkDurationMinutes?: number;
   }) => {
     const {
       audioFile,
@@ -241,11 +266,15 @@ export default function App() {
       languageHint,
       targetTranslationLang,
       generateSummary,
+      chunkDurationMinutes = 3,
     } = config;
+
+    const chunkDurationSec = Math.max(30, Math.round(chunkDurationMinutes * 60));
+    const shouldChunk = isOver30Minutes || duration > chunkDurationSec || audioFile.size > 8 * 1024 * 1024;
 
     setIsProcessing(true);
     setProcessingFileName(fileName);
-    setIsChunkedProcessing(isOver30Minutes);
+    setIsChunkedProcessing(shouldChunk);
     setProcessingError(null);
     setCurrentStepIndex(0);
 
@@ -257,7 +286,7 @@ export default function App() {
         id: 'inspect',
         label: '檔案長度偵測與格式分析',
         status: 'in_progress',
-        detail: `長度約 ${Math.round(duration)} 秒${isVideo ? ' (偵測到視訊檔案)' : ''}${isOver30Minutes ? ' (啟用智能分段)' : ''}`,
+        detail: `長度約 ${Math.round(duration)} 秒${isVideo ? ' (偵測到視訊檔案)' : ''}${shouldChunk ? ` (啟用自訂 ${chunkDurationMinutes} 分鐘分段切割)` : ''}`,
       },
       ...(isVideo
         ? [
@@ -269,13 +298,13 @@ export default function App() {
             },
           ]
         : []),
-      ...(isOver30Minutes
+      ...(shouldChunk
         ? [
             {
               id: 'slice',
-              label: '音訊智能分段切割 (每 3 分鐘為一區段)',
+              label: `音訊智能分段切割 (自訂每段 ${chunkDurationMinutes} 分鐘)`,
               status: 'waiting' as const,
-              detail: '無損切割並計算時間位移偏移植',
+              detail: `利用 16kHz 高保真降採樣將長音訊切割為 ${chunkDurationMinutes} 分鐘片段`,
             },
           ]
         : []),
@@ -347,16 +376,15 @@ export default function App() {
       let finalSummary: any = null;
       let chunksMeta: AudioChunkMeta[] = [];
 
-      // If over chunking threshold or large audio, slice audio into safe 3-minute chunks (16kHz mono = ~5.7MB)
-      if (isOver30Minutes) {
-        updateStep('slice', 'in_progress', '正在利用 Web Audio 進行高保真 16kHz 降採樣與分段切割...');
-        const CHUNK_LEN = 180; // 3 mins (180s) safe chunk size
-        const slices = await sliceAudioFile(workingAudioFile, CHUNK_LEN, (pct, cur, total) => {
+      // If over chunking threshold or large audio, slice audio into custom duration chunks (16kHz mono = ~5.7MB for 3min)
+      if (shouldChunk) {
+        updateStep('slice', 'in_progress', `正在利用 Web Audio 進行高保真 16kHz 降採樣與分段切割 (每段 ${chunkDurationMinutes} 分鐘)...`);
+        const slices = await sliceAudioFile(workingAudioFile, chunkDurationSec, (pct, cur, total) => {
           setChunkProgress({ current: cur, total });
           updateStep('slice', 'in_progress', `正在切割片段 ${cur} / ${total} (${pct}%)`);
         });
 
-        updateStep('slice', 'completed', `成功完成 ${slices.length} 個片段切割`);
+        updateStep('slice', 'completed', `成功完成 ${slices.length} 個片段切割 (每段 ${chunkDurationMinutes} 分鐘)`);
         stepIdx++;
         setCurrentStepIndex(stepIdx);
 
@@ -526,8 +554,9 @@ export default function App() {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         status: 'completed',
-        isChunked: isOver30Minutes,
-        chunksMeta: isOver30Minutes ? chunksMeta : undefined,
+        isChunked: shouldChunk || chunksMeta.length > 1,
+        chunkDurationMinutes: shouldChunk ? chunkDurationMinutes : undefined,
+        chunksMeta: shouldChunk ? chunksMeta : undefined,
         sourceLanguage: languageHint,
         fullTranscript: combinedTranscript,
         segments: allSegments,

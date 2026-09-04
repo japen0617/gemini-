@@ -47,10 +47,18 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
   onSaveConfig,
   onClearConfig,
 }) => {
-  const [selectedPlatform, setSelectedPlatform] = useState<PlatformType>(
-    apiConfig.platform || apiConfig.keyType || 'auto'
+  const [selectedPlatform, setSelectedPlatform] = useState<'gemini_api' | 'agent_platform'>(
+    apiConfig.platform === 'agent_platform' ? 'agent_platform' : 'gemini_api'
   );
-  const [keyInput, setKeyInput] = useState(apiConfig.apiKey || '');
+
+  // Strictly separate API keys for Google AI Studio and Agent Platform
+  const [geminiApiKey, setGeminiApiKey] = useState(
+    apiConfig.geminiApiKey || (apiConfig.platform === 'gemini_api' ? apiConfig.apiKey : '') || ''
+  );
+  const [agentPlatformKey, setAgentPlatformKey] = useState(
+    apiConfig.agentPlatformKey || (apiConfig.platform === 'agent_platform' ? apiConfig.apiKey : '') || ''
+  );
+
   const [gcpProjectId, setGcpProjectId] = useState(apiConfig.gcpProjectId || '');
   const [gcpLocation, setGcpLocation] = useState(apiConfig.gcpLocation || 'global');
   const [customEndpoint, setCustomEndpoint] = useState(apiConfig.customEndpoint || '');
@@ -74,21 +82,26 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Compute live preview URL based on selections
+  // Active key based on currently selected tab
+  const activeKeyForTab = selectedPlatform === 'agent_platform' ? agentPlatformKey : geminiApiKey;
+
+  // Compute live preview URL based on user platform requirements
   const getPreviewEndpoint = () => {
-    if (customEndpoint.trim()) {
-      return customEndpoint.trim();
+    if (selectedPlatform === 'gemini_api') {
+      // User mandate: 我選擇AI studio 的時候就只能使用 https://generativelanguage.googleapis.com/v1beta 這個端點為主
+      // Model mandate: 模型選擇用 Gemini 3.5 Transcribe
+      return 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-transcribe:generateContent';
     }
     if (selectedPlatform === 'agent_platform') {
+      if (customEndpoint.trim()) {
+        return customEndpoint.trim();
+      }
       const loc = gcpLocation || 'global';
       const proj = gcpProjectId.trim() || '{PROJECT_ID}';
       const host = loc === 'global' ? 'aiplatform.googleapis.com' : `${loc}-aiplatform.googleapis.com`;
       return `https://${host}/v1/projects/${proj}/locations/${loc}/publishers/google/models/gemini-3.5-transcribe-preview:generateContent`;
     }
-    if (selectedPlatform === 'gemini_api') {
-      return 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
-    }
-    return 'https://aiplatform.googleapis.com (Agent Platform) 或 https://generativelanguage.googleapis.com (自動路由)';
+    return 'https://generativelanguage.googleapis.com/v1beta (AI Studio) 或 https://aiplatform.googleapis.com (Agent Platform)';
   };
 
   // Perform probe testing on target platform and endpoint
@@ -97,16 +110,20 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
     setValidationResult(null);
     setSavedSuccess(false);
 
+    const activeKeyToValidate = selectedPlatform === 'agent_platform' ? agentPlatformKey.trim() : geminiApiKey.trim();
+
     try {
       const res = await fetch('/api/validate-key', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          apiKey: keyInput.trim() || undefined,
+          apiKey: activeKeyToValidate || undefined,
+          geminiApiKey: geminiApiKey.trim() || undefined,
+          agentPlatformKey: agentPlatformKey.trim() || undefined,
           platform: selectedPlatform,
-          gcpProjectId: gcpProjectId.trim() || undefined,
-          gcpLocation: gcpLocation || 'us-central1',
-          customEndpoint: customEndpoint.trim() || undefined,
+          gcpProjectId: selectedPlatform === 'agent_platform' ? gcpProjectId.trim() || undefined : undefined,
+          gcpLocation: selectedPlatform === 'agent_platform' ? gcpLocation || 'global' : undefined,
+          customEndpoint: selectedPlatform === 'agent_platform' ? customEndpoint.trim() || undefined : undefined,
         }),
       });
 
@@ -116,12 +133,14 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
         setValidationResult(data);
         const newConfig: ApiConfig = {
           platform: selectedPlatform,
-          apiKey: keyInput.trim(),
+          apiKey: activeKeyToValidate,
+          geminiApiKey: geminiApiKey.trim(),
+          agentPlatformKey: agentPlatformKey.trim(),
           keyType: selectedPlatform,
           detectedType: data.platform || data.detectedType || (selectedPlatform === 'agent_platform' ? 'agent_platform' : 'gemini_api'),
-          gcpProjectId: gcpProjectId.trim() || undefined,
-          gcpLocation: gcpLocation || 'us-central1',
-          customEndpoint: customEndpoint.trim() || undefined,
+          gcpProjectId: selectedPlatform === 'agent_platform' ? gcpProjectId.trim() || undefined : undefined,
+          gcpLocation: selectedPlatform === 'agent_platform' ? gcpLocation || 'global' : undefined,
+          customEndpoint: selectedPlatform === 'agent_platform' ? customEndpoint.trim() || undefined : undefined,
           status: 'valid',
           message: data.message,
           latencyMs: data.latencyMs,
@@ -137,7 +156,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
       } else {
         setValidationResult({
           valid: false,
-          error: data.error || '端點連線驗證未通過，請檢查金鑰與專案設定後重試。',
+          error: data.error || '端點連線驗證未通過，請檢查金鑰設定後重試。',
           latencyMs: data.latencyMs,
         });
         return null;
@@ -155,14 +174,17 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
 
   // Direct Apply & Save (even without running explicit probe)
   const handleDirectSave = () => {
+    const activeKeyToSave = selectedPlatform === 'agent_platform' ? agentPlatformKey.trim() : geminiApiKey.trim();
     const newConfig: ApiConfig = {
       platform: selectedPlatform,
-      apiKey: keyInput.trim(),
+      apiKey: activeKeyToSave,
+      geminiApiKey: geminiApiKey.trim(),
+      agentPlatformKey: agentPlatformKey.trim(),
       keyType: selectedPlatform,
       detectedType: selectedPlatform === 'agent_platform' ? 'agent_platform' : 'gemini_api',
-      gcpProjectId: gcpProjectId.trim() || undefined,
-      gcpLocation: gcpLocation || 'us-central1',
-      customEndpoint: customEndpoint.trim() || undefined,
+      gcpProjectId: selectedPlatform === 'agent_platform' ? gcpProjectId.trim() || undefined : undefined,
+      gcpLocation: selectedPlatform === 'agent_platform' ? gcpLocation || 'global' : undefined,
+      customEndpoint: selectedPlatform === 'agent_platform' ? customEndpoint.trim() || undefined : undefined,
       status: 'valid',
       testedAt: new Date().toISOString(),
     };
@@ -174,8 +196,28 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
     }, 800);
   };
 
-  const handleClear = () => {
-    setKeyInput('');
+  const handleClearCurrentKey = () => {
+    if (selectedPlatform === 'gemini_api') {
+      setGeminiApiKey('');
+      onSaveConfig({
+        ...apiConfig,
+        geminiApiKey: '',
+        apiKey: apiConfig.platform === 'gemini_api' ? '' : apiConfig.apiKey,
+      });
+    } else {
+      setAgentPlatformKey('');
+      onSaveConfig({
+        ...apiConfig,
+        agentPlatformKey: '',
+        apiKey: apiConfig.platform === 'agent_platform' ? '' : apiConfig.apiKey,
+      });
+    }
+    setValidationResult(null);
+  };
+
+  const handleClearAll = () => {
+    setGeminiApiKey('');
+    setAgentPlatformKey('');
     setGcpProjectId('');
     setCustomEndpoint('');
     setValidationResult(null);
@@ -235,7 +277,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                 點選平台卡片後可立即測試連線或套用切換
               </span>
             </div>
-            <div className="grid grid-cols-3 gap-2.5">
+            <div className="grid grid-cols-2 gap-3">
               {/* Option 1: AI Studio */}
               <button
                 type="button"
@@ -257,8 +299,11 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                   )}
                 </div>
                 <span className="text-xs font-bold">Google AI Studio</span>
-                <span className="text-[10px] text-slate-400 mt-0.5 leading-tight">
-                  Gemini API 原生端點
+                <span className="text-[10px] text-indigo-300 font-mono mt-0.5 leading-tight">
+                  Gemini 3.5 Transcribe
+                </span>
+                <span className="text-[9px] text-slate-400 mt-0.5">
+                  v1beta 專屬端點 (支援所有金鑰格式)
                 </span>
               </button>
 
@@ -286,31 +331,8 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                 <span className="text-[10px] text-purple-300 font-mono mt-0.5 leading-tight">
                   Gemini 3.5 Transcribe
                 </span>
-              </button>
-
-              {/* Option 3: Auto Detect */}
-              <button
-                type="button"
-                id="platform-tab-auto"
-                onClick={() => {
-                  setSelectedPlatform('auto');
-                  setValidationResult(null);
-                }}
-                className={`flex flex-col items-start p-3.5 rounded-xl border text-left transition-all relative ${
-                  selectedPlatform === 'auto'
-                    ? 'bg-cyan-600/20 border-cyan-500 text-white ring-2 ring-cyan-500/40 shadow-lg shadow-cyan-500/10'
-                    : 'bg-slate-800/60 border-slate-700/80 text-slate-300 hover:bg-slate-800 hover:text-white'
-                }`}
-              >
-                <div className="flex items-center justify-between w-full mb-1.5">
-                  <Sparkles className={`w-4 h-4 ${selectedPlatform === 'auto' ? 'text-cyan-400' : 'text-slate-400'}`} />
-                  {selectedPlatform === 'auto' && (
-                    <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                  )}
-                </div>
-                <span className="text-xs font-bold">智慧自動判斷</span>
-                <span className="text-[10px] text-slate-400 mt-0.5 leading-tight">
-                  連線探針自動識別
+                <span className="text-[9px] text-slate-400 mt-0.5">
+                  Vertex 全球端點 (支援所有金鑰格式)
                 </span>
               </button>
             </div>
@@ -318,57 +340,103 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
 
           {/* Platform Specific Settings */}
           <div className="space-y-4 p-4 rounded-xl bg-slate-950/60 border border-slate-800">
-            {/* API Key Input */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-1.5">
-                  <Key className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>
-                    {selectedPlatform === 'agent_platform'
-                      ? 'Vertex AI API Key 或 GCP Bearer Token (選填)'
-                      : '自訂 Gemini API Key (選填，若留空將使用系統預設金鑰)'}
-                  </span>
-                </label>
-                {selectedPlatform !== 'agent_platform' ? (
-                  <a
-                    href="https://aistudio.google.com/app/apikey"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1"
-                  >
-                    <span>取得 Google AI Studio Key</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                ) : (
-                  <a
-                    href="https://console.cloud.google.com/vertex-ai"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-purple-400 hover:text-purple-300 flex items-center space-x-1"
-                  >
-                    <span>GCP Vertex AI 控制台</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                )}
-              </div>
-              <input
-                id="custom-api-key-input"
-                type="password"
-                value={keyInput}
-                onChange={(e) => setKeyInput(e.target.value)}
-                placeholder={
-                  selectedPlatform === 'agent_platform'
-                    ? '留空將使用伺服器預設金鑰，或貼上專屬 Token (如 AQ... 或 ya29...)'
-                    : '留空將使用伺服器預設金鑰，或貼上自訂 AI Studio 金鑰 (如 AIzaSy...)'
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white font-mono placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
-              />
-            </div>
+            {/* Google AI Studio Settings Tab View */}
+            {selectedPlatform === 'gemini_api' && (
+              <div className="space-y-3 animate-fadeIn">
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-indigo-300 uppercase tracking-wider flex items-center space-x-1.5">
+                      <Key className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Google AI Studio API Key (選填)</span>
+                    </label>
+                    <a
+                      href="https://aistudio.google.com/app/apikey"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1"
+                    >
+                      <span>取得 Google AI Studio Key</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <input
+                    id="ai-studio-api-key-input"
+                    type="password"
+                    value={geminiApiKey}
+                    onChange={(e) => setGeminiApiKey(e.target.value)}
+                    placeholder="留空將使用系統預設金鑰，或貼上您的 API Key (AQ... 或任何格式)"
+                    className="w-full bg-slate-900 border border-indigo-700/60 rounded-xl px-4 py-2.5 text-sm text-white font-mono placeholder:text-slate-500 focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400 transition-colors"
+                  />
+                </div>
 
-            {/* GCP Project ID and Location (Shown when Agent Platform is chosen or in Auto) */}
-            {(selectedPlatform === 'agent_platform' || selectedPlatform === 'auto') && (
-              <div className="space-y-2 pt-2 border-t border-slate-800/80">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* Google AI Studio Gemini 3.5 Transcribe Info Card */}
+                <div className="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-500/40 space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-indigo-200 flex items-center space-x-1.5">
+                      <Sparkles className="w-4 h-4 text-indigo-400" />
+                      <span>核心模型：Gemini 3.5 Transcribe</span>
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-mono border border-indigo-500/30">
+                      gemini-3.5-transcribe
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-indigo-200/90 leading-relaxed">
+                    在 Google AI Studio 平台模式下，系統一律嚴格限定連線至 <strong className="text-cyan-300 font-mono">https://generativelanguage.googleapis.com/v1beta</strong> 端點，以確保金鑰相容且穩定轉錄。
+                  </p>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 font-mono text-[10px]">
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-indigo-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">模型代號</span>
+                      <span className="text-indigo-300 font-semibold truncate block" title="gemini-3.5-transcribe">
+                        gemini-3.5-transcribe
+                      </span>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-indigo-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">強制端點</span>
+                      <span className="text-indigo-300 font-semibold">v1beta 主端點</span>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-indigo-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">音訊時長</span>
+                      <span className="text-indigo-300 font-semibold">15 分鐘完整音訊</span>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded-lg border border-indigo-500/20">
+                      <span className="text-slate-400 block text-[9px] font-sans">金鑰相容</span>
+                      <span className="text-indigo-300 font-semibold">通用 (AQ.../任何格式)</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Agent Platform Settings Tab View */}
+            {selectedPlatform === 'agent_platform' && (
+              <div className="space-y-3 animate-fadeIn">
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-purple-300 uppercase tracking-wider flex items-center space-x-1.5">
+                      <Key className="w-3.5 h-3.5 text-purple-400" />
+                      <span>Agent Platform / Vertex AI 憑證 (選填)</span>
+                    </label>
+                    <a
+                      href="https://console.cloud.google.com/vertex-ai"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-purple-400 hover:text-purple-300 flex items-center space-x-1"
+                    >
+                      <span>GCP Vertex AI 控制台</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <input
+                    id="agent-platform-api-key-input"
+                    type="password"
+                    value={agentPlatformKey}
+                    onChange={(e) => setAgentPlatformKey(e.target.value)}
+                    placeholder="留空將使用伺服器預設金鑰，或貼上專屬金鑰 / Token (AQ... 或任何格式)"
+                    className="w-full bg-slate-900 border border-purple-700/60 rounded-xl px-4 py-2.5 text-sm text-white font-mono placeholder:text-slate-500 focus:outline-none focus:border-purple-400 focus:ring-1 focus:ring-purple-400 transition-colors"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
                   <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-slate-300 flex items-center space-x-1">
                       <span>GCP 專案 ID (Project ID)</span>
@@ -414,13 +482,13 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                     </span>
                   </div>
                   <p className="text-[11px] text-purple-200/90 leading-relaxed">
-                    Gemini 3.5 Transcribe 是專業級語音轉錄核心主力，融合深度推理多模態能力與高度優化的語音轉文字工作流，單一請求即可完成完整預錄音訊檔案轉錄。
+                    Gemini 3.5 Transcribe 是專業級語音轉錄核心主力，專為大型預錄音訊語音轉文字工作流打造。
                   </p>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 font-mono text-[10px]">
                     <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
                       <span className="text-slate-400 block text-[9px] font-sans">模型代號</span>
                       <span className="text-purple-300 font-semibold truncate block" title="gemini-3.5-transcribe-preview">
-                        3.5-transcribe
+                        gemini-3.5-transcribe
                       </span>
                     </div>
                     <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
@@ -432,44 +500,42 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
                       <span className="text-purple-300 font-semibold">高達 15 分鐘</span>
                     </div>
                     <div className="bg-slate-900/80 p-2 rounded-lg border border-purple-500/20">
-                      <span className="text-slate-400 block text-[9px] font-sans">部署區域</span>
-                      <span className="text-purple-300 font-semibold">global / 全球</span>
+                      <span className="text-slate-400 block text-[9px] font-sans">金鑰相容</span>
+                      <span className="text-purple-300 font-semibold">通用 (AQ.../任何格式)</span>
                     </div>
                   </div>
                 </div>
-
-                <p className="text-[11px] text-slate-400 leading-relaxed bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
-                  💡 <strong className="text-slate-300">提示：</strong>Agent Platform 預設採用 <span className="text-purple-300 font-mono">global</span> 全球統一路由端點（aiplatform.googleapis.com），如需指定專案請填寫 GCP 專案 ID。若使用的是 Google AI Studio 普及金鑰（以 <code className="text-indigo-300 font-mono">AIza...</code> 開頭），可切換至 <strong className="text-indigo-300">「Google AI Studio」</strong> 進行轉錄。
-                </p>
               </div>
             )}
 
-            {/* Advanced Custom Base URL Accordion */}
-            <div className="pt-2 border-t border-slate-800/80">
-              <button
-                type="button"
-                onClick={() => setShowAdvanced(!showAdvanced)}
-                className="text-xs text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 py-1"
-              >
-                <ChevronRight className={`w-3.5 h-3.5 transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
-                <span>進階自訂端點 / API Proxy Gateway</span>
-              </button>
+            {/* Advanced Custom Base URL Accordion (Only in Agent Platform) */}
+            {selectedPlatform === 'agent_platform' && (
+              <div className="pt-2 border-t border-slate-800/80">
+                <button
+                  type="button"
+                  onClick={() => setShowAdvanced(!showAdvanced)}
+                  className="text-xs text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 py-1"
+                >
+                  <ChevronRight className={`w-3.5 h-3.5 transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
+                  <span>進階自訂端點 / API Proxy Gateway</span>
+                </button>
 
-              {showAdvanced && (
-                <div className="mt-2 space-y-1.5 animate-fadeIn">
-                  <input
-                    type="text"
-                    value={customEndpoint}
-                    onChange={(e) => setCustomEndpoint(e.target.value)}
-                    placeholder="例如: https://my-custom-proxy.internal.net"
-                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 transition-colors"
-                  />
-                  <p className="text-[11px] text-slate-500">
-                    若您的組織使用專屬 API 反向代理或私有 VPC Gateway，可在此指定自訂 Host URL。
-                  </p>
-                </div>
-              )}
-            </div>
+                {showAdvanced && (
+                  <div className="mt-2 space-y-1.5 animate-fadeIn">
+                    <input
+                      type="text"
+                      value={customEndpoint}
+                      onChange={(e) => setCustomEndpoint(e.target.value)}
+                      placeholder="例如: https://my-custom-proxy.internal.net"
+                      className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:border-purple-500 transition-colors"
+                    />
+                    <p className="text-[11px] text-slate-500">
+                      若您的組織使用專屬 API 反向代理或私有 VPC Gateway，可在此指定自訂 Host URL。
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Real-time Target Endpoint URL Preview with 1-Click Ping */}
@@ -542,42 +608,56 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
 
           {/* Current Saved Config Status */}
           {apiConfig && (
-            <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-700/60 flex items-center justify-between text-xs">
-              <div className="flex items-center space-x-2 text-slate-300 flex-wrap gap-y-1">
-                <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                <span>目前啟用平台：</span>
-                <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${
-                  apiConfig.platform === 'agent_platform'
-                    ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
-                    : apiConfig.platform === 'gemini_api'
-                    ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/40'
-                    : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                }`}>
-                  {apiConfig.platform === 'agent_platform' ? 'Vertex AI' : apiConfig.platform === 'gemini_api' ? 'Google AI Studio' : '智慧自動判斷'}
-                </span>
-                {apiConfig.apiKey ? (
-                  <span className="font-mono text-cyan-300 text-[11px]">
-                    (自訂金鑰: {apiConfig.apiKey.slice(0, 6)}••••)
+            <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-700/60 space-y-2 text-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2 text-slate-300 flex-wrap gap-y-1">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  <span>目前啟用平台：</span>
+                  <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${
+                    apiConfig.platform === 'agent_platform'
+                      ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+                      : apiConfig.platform === 'gemini_api'
+                      ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/40'
+                      : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                  }`}>
+                    {apiConfig.platform === 'agent_platform' ? 'Vertex AI' : apiConfig.platform === 'gemini_api' ? 'Google AI Studio' : '智慧自動判斷'}
                   </span>
-                ) : (
-                  <span className="text-slate-400 text-[11px]">(系統預設金鑰)</span>
-                )}
-                {apiConfig.latencyMs && (
-                  <span className="text-[10px] text-emerald-400 font-mono bg-emerald-950/40 px-1.5 py-0.2 rounded border border-emerald-800/40">
-                    {apiConfig.latencyMs}ms
-                  </span>
-                )}
+                  {apiConfig.latencyMs && (
+                    <span className="text-[10px] text-emerald-400 font-mono bg-emerald-950/40 px-1.5 py-0.2 rounded border border-emerald-800/40">
+                      {apiConfig.latencyMs}ms
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center space-x-2">
+                  {(geminiApiKey || agentPlatformKey || apiConfig.apiKey) && (
+                    <button
+                      type="button"
+                      onClick={handleClearAll}
+                      className="text-rose-400 hover:text-rose-300 flex items-center space-x-1 shrink-0"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>清除金鑰</span>
+                    </button>
+                  )}
+                </div>
               </div>
-              {apiConfig.apiKey && (
-                <button
-                  type="button"
-                  onClick={handleClear}
-                  className="text-rose-400 hover:text-rose-300 flex items-center space-x-1 shrink-0 ml-2"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>清除自訂金鑰</span>
-                </button>
-              )}
+
+              {/* Separated Key Status Badges */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 border-t border-slate-800/60">
+                <div className="flex items-center justify-between p-2 rounded bg-slate-900/60 border border-slate-800">
+                  <span className="text-slate-400 text-[11px]">AI Studio 金鑰:</span>
+                  <span className="font-mono text-[11px] text-indigo-300">
+                    {geminiApiKey ? `${geminiApiKey.slice(0, 6)}••••` : '(系統預設金鑰)'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-900/60 border border-slate-800">
+                  <span className="text-slate-400 text-[11px]">Agent Platform 金鑰:</span>
+                  <span className="font-mono text-[11px] text-purple-300">
+                    {agentPlatformKey ? `${agentPlatformKey.slice(0, 6)}••••` : '(系統預設金鑰)'}
+                  </span>
+                </div>
+              </div>
             </div>
           )}
         </div>

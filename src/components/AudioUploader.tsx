@@ -40,6 +40,7 @@ interface AudioUploaderProps {
     languageHint: string;
     targetTranslationLang?: string;
     generateSummary: boolean;
+    chunkDurationMinutes?: number;
   }) => void;
   isProcessing: boolean;
   apiConfig?: ApiConfig;
@@ -74,6 +75,18 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
   const [enableTranslation, setEnableTranslation] = useState<boolean>(true);
   const [generateSummary, setGenerateSummary] = useState<boolean>(true);
 
+  // Custom chunk duration setting (in minutes, default 3)
+  const [chunkDurationMinutes, setChunkDurationMinutes] = useState<number>(() => {
+    const saved = localStorage.getItem('gemini_custom_chunk_minutes');
+    const parsed = saved ? parseFloat(saved) : 3;
+    return parsed >= 0.5 && parsed <= 15 ? parsed : 3;
+  });
+  const [isCustomInputMode, setIsCustomInputMode] = useState<boolean>(() => {
+    const saved = localStorage.getItem('gemini_custom_chunk_minutes');
+    const parsed = saved ? parseFloat(saved) : 3;
+    return ![1, 2, 3, 5, 10, 15].includes(parsed);
+  });
+
   // Recording state
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
@@ -88,6 +101,15 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
   // Drag & drop
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Re-calculate audio metadata when chunk duration or file changes
+  useEffect(() => {
+    if (selectedFile) {
+      getAudioMetadata(selectedFile, chunkDurationMinutes)
+        .then((meta) => setAudioMetadata(meta))
+        .catch(() => {});
+    }
+  }, [chunkDurationMinutes, selectedFile]);
 
   // Clean up preview URLs
   useEffect(() => {
@@ -112,7 +134,7 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
     setAudioPreviewUrl(url);
 
     try {
-      const meta = await getAudioMetadata(file);
+      const meta = await getAudioMetadata(file, chunkDurationMinutes);
       setAudioMetadata(meta);
     } catch (err) {
       console.warn('Metadata inspection warning:', err);
@@ -167,7 +189,7 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
         const url = URL.createObjectURL(audioBlob);
         setAudioPreviewUrl(url);
 
-        const meta = await getAudioMetadata(audioBlob);
+        const meta = await getAudioMetadata(audioBlob, chunkDurationMinutes);
         setAudioMetadata(meta);
 
         // Stop media tracks
@@ -319,7 +341,7 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
       setAudioPreviewUrl(url);
 
       try {
-        const meta = await getAudioMetadata(loadedBlob);
+        const meta = await getAudioMetadata(loadedBlob, chunkDurationMinutes);
         setAudioMetadata(meta);
       } catch (metaErr) {
         console.warn('Metadata parse non-blocking notice:', metaErr);
@@ -354,6 +376,7 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
       languageHint,
       targetTranslationLang: enableTranslation ? targetTranslationLang : undefined,
       generateSummary,
+      chunkDurationMinutes,
     });
   };
 
@@ -758,7 +781,7 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
                 <Scissors className="w-5 h-5 text-indigo-400 flex-shrink-0 mt-0.5" />
                 <div>
                   <div className="font-semibold text-indigo-300 flex items-center space-x-1.5">
-                    <span>音訊分段優化（智能防爆量切割已就緒）</span>
+                    <span>音訊分段優化（已套用每段 {chunkDurationMinutes} 分鐘設定）</span>
                   </div>
                   <p className="text-indigo-200/90 mt-1 leading-relaxed">
                     本檔案長度為 <strong className="text-white">{audioMetadata.durationFormatted}</strong>。系統將自動進行 16kHz 高保真降採樣並無損切割為{' '}
@@ -769,6 +792,126 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
             )}
           </div>
         )}
+
+        {/* Custom Audio Chunking Duration Setting */}
+        <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800/80 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center space-x-2">
+              <div className="w-7 h-7 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
+                <Scissors className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <span className="text-xs font-bold text-white">音訊切割單位長度 (分段時長)</span>
+                <p className="text-[11px] text-slate-400">
+                  當音訊超過此時長或檔案大於 8MB 時自動分段轉錄並精準拼接
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center space-x-1.5 self-start sm:self-auto">
+              <span className="text-xs font-mono px-2.5 py-1 rounded-lg bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 font-bold">
+                目前設定: 每段 {chunkDurationMinutes} 分鐘
+              </span>
+            </div>
+          </div>
+
+          {/* Quick preset chips and custom input */}
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            {[1, 2, 3, 5, 10, 15].map((presetMins) => {
+              const isActive = !isCustomInputMode && chunkDurationMinutes === presetMins;
+              return (
+                <button
+                  key={presetMins}
+                  type="button"
+                  onClick={() => {
+                    setIsCustomInputMode(false);
+                    setChunkDurationMinutes(presetMins);
+                    localStorage.setItem('gemini_custom_chunk_minutes', String(presetMins));
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+                    isActive
+                      ? 'bg-indigo-600 border-indigo-500 text-white shadow-md shadow-indigo-600/20 font-semibold scale-105'
+                      : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-500 hover:bg-slate-800'
+                  }`}
+                >
+                  {presetMins} 分鐘 {presetMins === 3 ? '(推薦)' : presetMins === 15 ? '(上限)' : ''}
+                </button>
+              );
+            })}
+
+            <button
+              type="button"
+              onClick={() => setIsCustomInputMode(true)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+                isCustomInputMode
+                  ? 'bg-purple-600 border-purple-500 text-white shadow-md shadow-purple-600/20 font-semibold'
+                  : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-500 hover:bg-slate-800'
+              }`}
+            >
+              自訂分鐘數...
+            </button>
+          </div>
+
+          {/* Custom Minute Input Field */}
+          {isCustomInputMode && (
+            <div className="flex flex-col sm:flex-row sm:items-center gap-3 p-3 rounded-lg bg-slate-900/90 border border-purple-500/30 animate-fadeIn">
+              <div className="flex items-center space-x-2">
+                <span className="text-xs text-slate-300 font-medium">自訂切割長度:</span>
+                <input
+                  type="number"
+                  min="0.5"
+                  max="15"
+                  step="0.5"
+                  value={chunkDurationMinutes}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (!isNaN(val)) {
+                      const safeVal = Math.max(0.5, Math.min(15, val));
+                      setChunkDurationMinutes(safeVal);
+                      localStorage.setItem('gemini_custom_chunk_minutes', String(safeVal));
+                    }
+                  }}
+                  className="w-24 bg-slate-950 border border-purple-500/50 rounded-lg px-2.5 py-1.5 text-sm text-white font-mono focus:outline-none focus:ring-1 focus:ring-purple-400 text-center"
+                />
+                <span className="text-xs text-slate-400">分鐘 (支援 0.5 ~ 15 分鐘)</span>
+              </div>
+
+              <input
+                type="range"
+                min="0.5"
+                max="15"
+                step="0.5"
+                value={chunkDurationMinutes}
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  setChunkDurationMinutes(val);
+                  localStorage.setItem('gemini_custom_chunk_minutes', String(val));
+                }}
+                className="flex-1 accent-purple-500 cursor-pointer"
+              />
+            </div>
+          )}
+
+          {/* Real-time estimation info */}
+          {audioMetadata && audioMetadata.duration > 0 && (
+            <div className="text-[11px] text-slate-400 flex items-center space-x-2 pt-1 border-t border-slate-800/60">
+              <Clock className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+              <span>
+                音訊總長度 <strong className="text-white font-mono">{audioMetadata.durationFormatted}</strong>
+                {audioMetadata.duration > chunkDurationMinutes * 60 || (selectedFile && selectedFile.size > 8 * 1024 * 1024) ? (
+                  <>
+                    {' '}➔ 依每段 <strong className="text-indigo-300 font-mono">{chunkDurationMinutes} 分鐘</strong> 切割，預計分為{' '}
+                    <strong className="text-amber-300 font-mono">{Math.max(1, Math.ceil(audioMetadata.duration / (chunkDurationMinutes * 60)))} 個片段</strong> 依序轉錄並無縫對齊
+                  </>
+                ) : (
+                  <>
+                    {' '}➔ 未超過 {chunkDurationMinutes} 分鐘，將作為<strong className="text-emerald-300">單一完整片段</strong>直接轉錄
+                  </>
+                )}
+              </span>
+            </div>
+          )}
+        </div>
 
         {/* Processing Configuration */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-800">

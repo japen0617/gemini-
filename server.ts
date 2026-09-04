@@ -55,6 +55,8 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 // Interface for Platform Options
 interface PlatformConfig {
   apiKey?: string;
+  geminiApiKey?: string;
+  agentPlatformKey?: string;
   platform?: 'auto' | 'gemini_api' | 'agent_platform';
   gcpProjectId?: string;
   gcpLocation?: string;
@@ -63,15 +65,28 @@ interface PlatformConfig {
 
 // Extract Platform Config from request headers
 function getPlatformConfigFromReq(req: express.Request): PlatformConfig {
-  const apiKey = (req.headers['x-gemini-api-key'] || req.headers['x-api-key'] || '') as string;
-  const platform = (req.headers['x-platform-type'] || 'auto') as 'auto' | 'gemini_api' | 'agent_platform';
+  const geminiApiKey = (req.headers['x-gemini-api-key'] || req.headers['x-ai-studio-key'] || '') as string;
+  const agentPlatformKey = (req.headers['x-agent-platform-key'] || '') as string;
+  const genericApiKey = (req.headers['x-api-key'] || '') as string;
+  const platform = (req.headers['x-platform-type'] || 'gemini_api') as 'auto' | 'gemini_api' | 'agent_platform';
   const gcpProjectId = (req.headers['x-gcp-project-id'] || '') as string;
   const gcpLocation = (req.headers['x-gcp-location'] || 'us-central1') as string;
   const customEndpoint = (req.headers['x-custom-endpoint'] || '') as string;
 
+  // Resolve appropriate active key based on platform
+  let activeKey = '';
+  if (platform === 'agent_platform') {
+    activeKey = agentPlatformKey || genericApiKey || geminiApiKey;
+  } else {
+    // gemini_api or auto default to AI Studio
+    activeKey = geminiApiKey || genericApiKey;
+  }
+
   return {
-    apiKey: apiKey.trim() || undefined,
-    platform: platform || 'auto',
+    apiKey: activeKey.trim() || undefined,
+    geminiApiKey: geminiApiKey.trim() || undefined,
+    agentPlatformKey: agentPlatformKey.trim() || undefined,
+    platform: platform || 'gemini_api',
     gcpProjectId: gcpProjectId.trim() || undefined,
     gcpLocation: gcpLocation.trim() || 'us-central1',
     customEndpoint: customEndpoint.trim() || undefined,
@@ -80,20 +95,24 @@ function getPlatformConfigFromReq(req: express.Request): PlatformConfig {
 
 // Factory to create GoogleGenAI client with selected platform settings
 function createGenAIClient(config: PlatformConfig): { client: GoogleGenAI; platform: 'gemini_api' | 'agent_platform'; endpointUrl: string } {
-  const { apiKey, platform = 'auto', gcpProjectId, gcpLocation = 'us-central1', customEndpoint } = config;
-  const resolvedKey = apiKey || process.env.GEMINI_API_KEY || '';
+  const { apiKey, geminiApiKey, agentPlatformKey, platform = 'gemini_api', gcpProjectId, gcpLocation = 'us-central1', customEndpoint } = config;
 
   // Determine active platform
   let activePlatform: 'gemini_api' | 'agent_platform' = 'gemini_api';
   if (platform === 'agent_platform') {
     activePlatform = 'agent_platform';
+  } else if (platform === 'gemini_api') {
+    activePlatform = 'gemini_api';
   } else if (platform === 'auto') {
-    if (gcpProjectId || (apiKey && apiKey.startsWith('AQ') && apiKey.length > 50)) {
-      activePlatform = 'agent_platform';
-    } else {
-      activePlatform = 'gemini_api';
-    }
+    activePlatform = gcpProjectId ? 'agent_platform' : 'gemini_api';
   }
+
+  const resolvedKey =
+    (activePlatform === 'agent_platform'
+      ? (agentPlatformKey || apiKey)
+      : (geminiApiKey || apiKey)) ||
+    process.env.GEMINI_API_KEY ||
+    '';
 
   let endpointUrl = '';
   let client: GoogleGenAI;
@@ -116,17 +135,17 @@ function createGenAIClient(config: PlatformConfig): { client: GoogleGenAI; platf
         },
       });
     } else {
-      // Without project ID, default to direct GoogleGenAI client to avoid 404 endpoint mismatch
+      // Without project ID, default to direct GoogleGenAI client
       client = new GoogleGenAI({
         apiKey: resolvedKey,
       });
     }
   } else {
-    // Google AI Studio
-    endpointUrl = customEndpoint || 'https://generativelanguage.googleapis.com';
+    // Google AI Studio: STRICTLY https://generativelanguage.googleapis.com/v1beta
+    // Per user mandate: 選擇AI studio 的時候就只能使用 https://generativelanguage.googleapis.com/v1beta 端點
+    endpointUrl = 'https://generativelanguage.googleapis.com/v1beta';
     client = new GoogleGenAI({
       apiKey: resolvedKey,
-      httpOptions: customEndpoint ? { baseUrl: customEndpoint } : undefined,
     });
   }
 
@@ -135,6 +154,16 @@ function createGenAIClient(config: PlatformConfig): { client: GoogleGenAI; platf
 
 // Helper to call ai.models.generateContent with exponential backoff on 429 / 503 / transient rate limit errors
 // and automatic fallback model/client switching on high-demand, 404 or endpoint/model errors
+// Waterfall model cascade for text processing and general tasks:
+// 1. Gemini 3.8 Flash (預設首選)
+// 2. Gemini 3.7 Flash (若 3.8 額度滿/速率限制，優先降級)
+// 3. Gemini 3.5 Flash (若 3.8 與 3.7 額度皆滿，進一步降級)
+const FLASH_CASCADE_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.5-flash',
+] as const;
+
 async function generateContentWithRetry(
   ai: GoogleGenAI,
   params: any,
@@ -142,18 +171,23 @@ async function generateContentWithRetry(
   fallbackApiKey?: string
 ): Promise<any> {
   let attempt = 0;
-  let currentModel = params.model;
-  // Alternate fallback models if the primary model is experiencing 503 high demand spikes or 404/403
-  const candidateModels = [
-    currentModel,
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
-    'gemini-3.5-transcribe-preview',
-  ].filter((m, i, arr) => Boolean(m) && arr.indexOf(m) === i);
+  let currentModel = params.model || 'gemini-3.8-flash';
+
+  // Construct candidate models sequence strictly respecting user instruction:
+  // Primary: gemini-3.8-flash -> Fallback 1: gemini-3.7-flash -> Fallback 2: gemini-3.5-flash
+  let candidateModels: string[];
+  if (currentModel.includes('transcribe')) {
+    candidateModels = [currentModel, 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
+  } else {
+    candidateModels = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
+    if (!candidateModels.includes(currentModel)) {
+      candidateModels = [currentModel, ...candidateModels];
+    }
+  }
 
   let modelIdx = candidateModels.indexOf(currentModel);
   if (modelIdx < 0) modelIdx = 0;
+  currentModel = candidateModels[modelIdx];
 
   let currentAi = ai;
 
@@ -173,7 +207,8 @@ async function generateContentWithRetry(
         errMsg.includes('429') ||
         errMsg.includes('Resource exhausted') ||
         errMsg.includes('RESOURCE_EXHAUSTED') ||
-        errMsg.includes('quota');
+        errMsg.includes('quota') ||
+        errMsg.includes('Quota exceeded');
       const isTransient =
         status === 503 ||
         status === 'UNAVAILABLE' ||
@@ -204,17 +239,19 @@ async function generateContentWithRetry(
         }
       }
 
-      // Try next model if model is not found, busy, or has permission restriction on specific model
+      // Try next model in the waterfall cascade:
+      // gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash
       if ((isTransient || isModelOrAuthIssue || isRateLimit) && modelIdx + 1 < candidateModels.length) {
         modelIdx++;
+        const prevModel = currentModel;
         currentModel = candidateModels[modelIdx];
-        const delayMs = isRateLimit ? Math.min(4000, 1000 * Math.pow(2, attempt - 1)) : 200;
-        console.info(
-          `[GenAI Retry] Switching to model ${currentModel} (reason: ${status || 'fallback'}, attempt ${attempt}/${maxRetries})...`
+        const delayMs = isRateLimit ? 400 : 200;
+        console.warn(
+          `[GenAI Quota/Demand Fallback] ${prevModel} (reason: ${status || 'quota limit'}). Downgrading to ${currentModel} (attempt ${attempt}/${maxRetries})...`
         );
         await new Promise((r) => setTimeout(r, delayMs));
       } else if (isRateLimit && attempt <= maxRetries) {
-        const delayMs = Math.min(6000, 1000 * Math.pow(2, attempt - 1) + Math.random() * 500);
+        const delayMs = Math.min(4000, 1000 * Math.pow(2, attempt - 1) + Math.random() * 500);
         await new Promise((r) => setTimeout(r, delayMs));
       } else {
         throw err;
@@ -228,8 +265,10 @@ function getPlatformModels(platform: 'gemini_api' | 'agent_platform') {
   if (platform === 'agent_platform') {
     return {
       transcribe: 'gemini-3.5-transcribe-preview',
-      fallback: 'gemini-2.5-flash',
-      general: 'gemini-2.5-flash',
+      fallback: 'gemini-3.8-flash',
+      general: 'gemini-3.8-flash',
+      cascadeFallback1: 'gemini-3.7-flash',
+      cascadeFallback2: 'gemini-3.5-flash',
       modelName: 'Gemini 3.5 Transcribe Preview',
       maxAudioDurationMinutes: 15,
       supportedDataTypes: 'Inputs: audio Output: text',
@@ -238,12 +277,14 @@ function getPlatformModels(platform: 'gemini_api' | 'agent_platform') {
     };
   }
   return {
-    transcribe: 'gemini-2.5-flash',
-    fallback: 'gemini-2.0-flash',
-    general: 'gemini-2.5-flash',
-    modelName: 'Gemini 2.5 Flash',
+    transcribe: 'gemini-3.5-transcribe',
+    fallback: 'gemini-3.8-flash',
+    general: 'gemini-3.8-flash',
+    cascadeFallback1: 'gemini-3.7-flash',
+    cascadeFallback2: 'gemini-3.5-flash',
+    modelName: 'Gemini 3.5 Transcribe',
     maxAudioDurationMinutes: 15,
-    supportedDataTypes: 'Inputs: audio/video/text Output: text/json',
+    supportedDataTypes: 'Inputs: audio Output: text',
     locations: 'global',
     isVertex: false,
   };
@@ -652,7 +693,7 @@ app.get('/api/health', (req, res) => {
 });
 
 /**
- * 1. Transcribe audio with gemini-3.5-transcribe (with gemini-3.7-flash fallback)
+ * 1. Transcribe audio with gemini-3.5-transcribe (with gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash fallback cascade)
  * Supports offsetSeconds for chunked audio
  */
 app.post('/api/transcribe', async (req, res) => {
@@ -791,16 +832,16 @@ Never return an empty response.`;
       }
     }
 
-    // Attempt 3: If activePlatform was agent_platform and failed, try standard Google AI Studio client with gemini-2.5-flash
+    // Attempt 3: If activePlatform was agent_platform and failed, try standard Google AI Studio client with gemini-3.5-transcribe
     if (!fullTranscript && activePlatform === 'agent_platform') {
       try {
         const standardAi = new GoogleGenAI({
-          apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
+          apiKey: platformConfig.geminiApiKey || platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
         });
         const standardResponse = await generateContentWithRetry(
           standardAi,
           {
-            model: 'gemini-2.5-flash',
+            model: 'gemini-3.5-transcribe',
             contents: [audioPart, transcriptionPrompt],
           },
           2
@@ -1098,7 +1139,7 @@ Return ONLY a JSON array where each object has "id" and "text" (translated).`;
       const response = await generateContentWithRetry(
         ai,
         {
-          model: models.general || 'gemini-2.5-flash',
+          model: models.general || 'gemini-3.8-flash',
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
@@ -1123,19 +1164,29 @@ Return ONLY a JSON array where each object has "id" and "text" (translated).`;
       const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       translatedList = JSON.parse(cleanJson);
     } catch (genErr: any) {
-      console.warn('[Translate] Primary structured translation attempt failed, trying direct text fallback client...', genErr?.message);
-      try {
-        const standardAi = new GoogleGenAI({
-          apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
-        });
-        const fallbackRes = await standardAi.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-        });
-        const raw = fallbackRes.text?.trim() || '[]';
-        const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-        translatedList = JSON.parse(cleanJson);
-      } catch (secErr: any) {
+      console.warn('[Translate] Primary structured translation attempt failed, trying cascade fallback...', genErr?.message);
+      // Secondary attempt with plain text across user cascade:
+      // gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash
+      const standardAi = new GoogleGenAI({
+        apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
+      });
+      for (const cascadeModel of FLASH_CASCADE_MODELS) {
+        try {
+          const fallbackRes = await standardAi.models.generateContent({
+            model: cascadeModel,
+            contents: prompt,
+          });
+          const raw = fallbackRes.text?.trim() || '[]';
+          const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+          translatedList = JSON.parse(cleanJson);
+          if (Array.isArray(translatedList) && translatedList.length > 0) {
+            break;
+          }
+        } catch {
+          // continue to next model in cascade
+        }
+      }
+      if (!Array.isArray(translatedList) || translatedList.length === 0) {
         if (sampleMatch && sampleMatch.translations[targetLanguage]) {
           translatedList = sampleMatch.translations[targetLanguage];
         } else {
@@ -1213,7 +1264,7 @@ Return ONLY JSON matching the schema.`;
       const response = await generateContentWithRetry(
         ai,
         {
-          model: models.general || 'gemini-2.5-flash',
+          model: models.general || 'gemini-3.8-flash',
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
@@ -1252,19 +1303,28 @@ Return ONLY JSON matching the schema.`;
       const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       summary = JSON.parse(cleanJson);
     } catch (genErr: any) {
-      console.warn('[Summarize] Structured AI summary attempt failed, trying direct text fallback client...', genErr?.message);
-      try {
-        const standardAi = new GoogleGenAI({
-          apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
-        });
-        const fallbackRes = await standardAi.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-        });
-        const raw = fallbackRes.text?.trim() || '{}';
-        const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-        summary = JSON.parse(cleanJson);
-      } catch (secErr: any) {
+      console.warn('[Summarize] Structured AI summary attempt failed, trying cascade fallback...', genErr?.message);
+      const standardAi = new GoogleGenAI({
+        apiKey: platformConfig.apiKey || process.env.GEMINI_API_KEY || '',
+      });
+      for (const cascadeModel of FLASH_CASCADE_MODELS) {
+        try {
+          const fallbackRes = await standardAi.models.generateContent({
+            model: cascadeModel,
+            contents: prompt,
+          });
+          const raw = fallbackRes.text?.trim() || '{}';
+          const cleanJson = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+          summary = JSON.parse(cleanJson);
+          if (summary && summary.executiveSummary) {
+            break;
+          }
+        } catch {
+          // continue to next model in cascade
+        }
+      }
+
+      if (!summary || !summary.executiveSummary) {
         // Fallback default summary structure
         summary = {
           executiveSummary: transcript.slice(0, 300) + '...',
@@ -1381,16 +1441,27 @@ app.post('/api/sample-audio', async (req, res) => {
 app.post('/api/validate-key', async (req, res) => {
   const {
     apiKey,
-    platform = 'auto',
+    geminiApiKey,
+    agentPlatformKey,
+    platform = 'gemini_api',
     expectedType, // backward compat
     gcpProjectId,
     gcpLocation = 'us-central1',
     customEndpoint,
   } = req.body;
 
-  const targetPlatform = platform || expectedType || 'auto';
-  const hasCustomKey = Boolean(apiKey && typeof apiKey === 'string' && apiKey.trim());
-  const cleanKey = hasCustomKey ? (apiKey as string).trim() : (process.env.GEMINI_API_KEY || '');
+  const targetPlatform = platform || expectedType || 'gemini_api';
+
+  // Separate keys by platform
+  let keyForPlatform = '';
+  if (targetPlatform === 'agent_platform') {
+    keyForPlatform = (agentPlatformKey || apiKey || '').trim();
+  } else {
+    keyForPlatform = (geminiApiKey || apiKey || '').trim();
+  }
+
+  const hasCustomKey = Boolean(keyForPlatform);
+  const cleanKey = hasCustomKey ? keyForPlatform : (process.env.GEMINI_API_KEY || '');
 
   if (!cleanKey) {
     return res.status(400).json({
@@ -1404,6 +1475,8 @@ app.post('/api/validate-key', async (req, res) => {
   try {
     const { client: testAI, platform: activePlatform, endpointUrl } = createGenAIClient({
       apiKey: cleanKey,
+      geminiApiKey: targetPlatform === 'gemini_api' ? cleanKey : undefined,
+      agentPlatformKey: targetPlatform === 'agent_platform' ? cleanKey : undefined,
       platform: targetPlatform,
       gcpProjectId: gcpProjectId ? String(gcpProjectId).trim() : undefined,
       gcpLocation: gcpLocation || 'us-central1',
@@ -1411,16 +1484,42 @@ app.post('/api/validate-key', async (req, res) => {
     });
     const testModels = getPlatformModels(activePlatform);
 
-    // Probe with lightweight model call
-    const probeResponse = await testAI.models.generateContent({
-      model: testModels.general,
-      contents: 'Ping',
-    });
+    // Probe the target platform
+    if (activePlatform === 'gemini_api') {
+      try {
+        await testAI.models.get({ model: testModels.transcribe });
+      } catch (probeErr: any) {
+        // If transcribe model lookup gives 404 on get, try fallback general model to verify key authentication
+        if (
+          probeErr?.status !== 401 &&
+          probeErr?.status !== 403 &&
+          !probeErr?.message?.includes('API_KEY_INVALID') &&
+          !probeErr?.message?.includes('UNAUTHENTICATED') &&
+          !probeErr?.message?.includes('PERMISSION_DENIED')
+        ) {
+          try {
+            await testAI.models.get({ model: 'gemini-3.8-flash' });
+          } catch {
+            throw probeErr;
+          }
+        } else {
+          throw probeErr;
+        }
+      }
+    } else {
+      // For Agent Platform: probe endpoint
+      try {
+        await testAI.models.get({ model: testModels.transcribe });
+      } catch (probeErr: any) {
+        if (probeErr?.status === 404 || probeErr?.message?.includes('404')) {
+          throw probeErr;
+        }
+      }
+    }
 
     const latencyMs = Date.now() - startTime;
-    const responseText = probeResponse.text || '';
 
-    let label = 'Google AI Studio (Gemini 2.5 Flash / 3.5)';
+    let label = 'Google AI Studio (Gemini 3.5 Transcribe)';
     if (activePlatform === 'agent_platform') {
       label = gcpProjectId
         ? `Agent Platform (Gemini 3.5 Transcribe Preview) [專案: ${gcpProjectId} (${gcpLocation})]`
@@ -1439,7 +1538,7 @@ app.post('/api/validate-key', async (req, res) => {
       endpointUrl,
       latencyMs,
       isDefaultKey: !hasCustomKey,
-      message: `連線成功！${label} 驗證通過（模型: ${testModels.modelName}，來源: ${keySourceText}，延遲: ${latencyMs}ms），端點就緒。`,
+      message: `連線成功！${label} 驗證通過（模型: ${testModels.modelName}，端點: ${endpointUrl}，來源: ${keySourceText}，延遲: ${latencyMs}ms），端點就緒。`,
       testedAt: new Date().toISOString(),
     });
   } catch (err: any) {
@@ -1447,12 +1546,20 @@ app.post('/api/validate-key', async (req, res) => {
     const errorMsg = err?.message || '';
     const status = err?.status || '';
 
-    // If target was auto or specifically agent platform, check specific signatures
-    if (errorMsg.includes('API_KEY_INVALID') || errorMsg.includes('API key not valid')) {
+    // Handle authentication / invalid key
+    if (
+      errorMsg.includes('API_KEY_INVALID') ||
+      errorMsg.includes('API key not valid') ||
+      errorMsg.includes('ACCESS_TOKEN_TYPE_UNSUPPORTED') ||
+      errorMsg.includes('UNAUTHENTICATED')
+    ) {
       return res.json({
         valid: false,
         latencyMs,
-        error: 'API Key 無效或不存在，請確認金鑰是否複製完整。',
+        error:
+          targetPlatform === 'gemini_api'
+            ? 'Google AI Studio API Key 驗證未通過，請確認金鑰是否完整貼上且具有存取權限。'
+            : 'Agent Platform 憑證無效或過期，請確認授權 Token。',
       });
     }
 
@@ -1462,33 +1569,37 @@ app.post('/api/validate-key', async (req, res) => {
         platform: 'gemini_api',
         detectedType: 'gemini_api',
         label: 'Google AI Studio Key (已達速率限制)',
-        endpointUrl: 'https://generativelanguage.googleapis.com',
+        endpointUrl: 'https://generativelanguage.googleapis.com/v1beta',
         latencyMs,
         message: '金鑰格式正確且端點已連通，但目前該帳號已達 RPM 或免費用量限制，稍後或正式執行時可自動重試。',
         testedAt: new Date().toISOString(),
       });
     }
 
-    if (errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('Method not allowed') || errorMsg.includes('PROJECT')) {
-      // If user selected agent platform or auto
-      return res.json({
-        valid: true,
-        platform: 'agent_platform',
-        detectedType: 'agent_platform',
-        label: 'Agent Platform / 企業服務金鑰',
-        endpointUrl: customEndpoint || `https://${gcpLocation}-aiplatform.googleapis.com`,
-        latencyMs,
-        message: '金鑰格式驗證通過（已自動配置為 Agent Platform / Vertex AI 專屬授權管道）。',
-        testedAt: new Date().toISOString(),
-      });
-    }
-
-    if (errorMsg.includes('404') || errorMsg.includes('Not Found') || status === 404 || status === 'NOT_FOUND') {
-      return res.json({
-        valid: false,
-        latencyMs,
-        error: `端點 404 (Not Found)：Vertex AI 模型需填寫「GCP 專案 ID」且需選擇具體區域（如 us-central1 或 asia-east1）。若您使用的是 Google AI Studio 金鑰（以 AIza... 開頭），請切換至「Google AI Studio」分頁進行驗證。`,
-      });
+    if (targetPlatform === 'agent_platform') {
+      if (errorMsg.includes('404') || errorMsg.includes('Not Found') || status === 404 || status === 'NOT_FOUND') {
+        return res.json({
+          valid: false,
+          latencyMs,
+          error: `Vertex AI 端點 404 (Not Found)：請確認已填寫「GCP 專案 ID」且部署區域正確（建議選擇 global 或 us-central1）。若要使用 Google AI Studio 端點，請切換至「Google AI Studio」分頁進行驗證。`,
+        });
+      }
+    } else {
+      // Google AI Studio
+      if (errorMsg.includes('404') || errorMsg.includes('Not Found') || status === 404 || status === 'NOT_FOUND') {
+        return res.json({
+          valid: false,
+          latencyMs,
+          error: `Google AI Studio 端點 404 (Not Found)：找不到模型或端點未連通。請確認金鑰存取權限。`,
+        });
+      }
+      if (errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('API_KEY_SERVICE_BLOCKED')) {
+        return res.json({
+          valid: false,
+          latencyMs,
+          error: `Google AI Studio 存取權限受阻 (PERMISSION_DENIED)：此金鑰尚未開啟 Generative Language API 存取權限。`,
+        });
+      }
     }
 
     return res.json({
